@@ -1,0 +1,22 @@
+# Local files and build artifacts
+.DS_Store
+.build/
+build/
+*.app/
+*.zip
+*.dmg
+*.bundle
+*.log
+
+# Credentials and private signing material
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.keychain
+*.keychain-db
+transport-password
+
+# Signing/Qingyi.cer and Signing/identity.sha1 are public and intentionally tracked.
