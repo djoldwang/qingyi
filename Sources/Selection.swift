@@ -123,16 +123,34 @@ enum SelectionReader {
 }
 
 final class SelectionMonitor {
+    static var isLeftMouseDown: Bool { NSEvent.pressedMouseButtons & 1 != 0 }
     var onSelection: ((SelectionSnapshot?) -> Void)?
     var onOutsideClick: ((NSPoint) -> Void)?
     var onScroll: (() -> Void)?
+    var onCancel: (() -> Void)?
+    var onMenuCancel: (() -> Void)?
+    var isInternalInteraction: ((NSPoint) -> Bool)?
     var enabled = true
+    private(set) var modelMenuTracking = false
+    private var interactionEpoch = 0
+    private var ignoreEventsThrough: TimeInterval = 0
+    private var awaitingExternalInputAfterMenu = false
+    func setModelMenuTracking(_ value: Bool) {
+        guard value != modelMenuTracking else { return }
+        modelMenuTracking = value; interactionEpoch += 1; revision += 1
+        readRequested = false
+        if !value {
+            ignoreEventsThrough = ProcessInfo.processInfo.systemUptime
+            awaitingExternalInputAfterMenu = true
+            attachObserver()
+        }
+    }
     private var global: Any?
     private var local: Any?
     private var activation: NSObjectProtocol?
     private var observer: AXObserver?
     private var observedApp: AXUIElement?
-    private var pending: DispatchWorkItem?
+    private var readRequested = false
     private var readInFlight = false
     private var revision = 0
     private let readQueue = DispatchQueue(label: "com.laowang.qingyi.selection", qos: .userInitiated)
@@ -141,12 +159,18 @@ final class SelectionMonitor {
         let mask: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseUp, .keyUp, .keyDown, .scrollWheel]
         global = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] in self?.event($0) }
         local = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { [weak self] event in
-            if event.type == .keyDown, event.keyCode == 53 { self?.onScroll?() }
+            if let self = self, event.type == .keyDown, event.keyCode == 53, self.modelMenuTracking {
+                self.onMenuCancel?(); return nil
+            }
+            if let self = self, event.type == .keyDown, event.keyCode == 53,
+               !self.modelMenuTracking, event.timestamp > self.ignoreEventsThrough { (self.onCancel ?? self.onScroll)?() }
             return event
         }
-        activation = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.revision += 1
-            self?.onSelection?(nil)
+        activation = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
+            self?.invalidateInternalRead()
+            let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            if self?.modelMenuTracking == false, self?.awaitingExternalInputAfterMenu == false,
+               app?.processIdentifier != getpid() { self?.onSelection?(nil) }
             self?.attachObserver()
         }
         attachObserver()
@@ -168,48 +192,72 @@ final class SelectionMonitor {
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
         observer = created; observedApp = element
     }
-    private func event(_ event: NSEvent) {
+    func event(_ event: NSEvent) {
+        if modelMenuTracking {
+            if event.type == .keyDown, event.keyCode == 53 { onMenuCancel?() }
+            return
+        }
+        guard event.timestamp > ignoreEventsThrough else { return }
+        awaitingExternalInputAfterMenu = false
+        if !(event.type == .keyDown && event.keyCode == 53), isInternalInteraction?(NSEvent.mouseLocation) == true {
+            invalidateInternalRead(); return
+        }
         switch event.type {
         case .leftMouseDown:
-            revision += 1; pending?.cancel(); onOutsideClick?(NSEvent.mouseLocation)
+            // A new drag invalidates both queued and in-flight selection reads,
+            // and clears the old glyph even when the result window is pinned.
+            invalidateInternalRead(); onSelection?(nil); onOutsideClick?(NSEvent.mouseLocation)
         case .leftMouseUp: schedule()
         case .keyUp:
             if event.modifierFlags.contains(.shift) || (event.modifierFlags.contains(.command) && event.keyCode == 0) { schedule() }
         case .keyDown:
-            if event.keyCode == 53 { onScroll?() }
-            else if !event.modifierFlags.contains(.shift) && !event.modifierFlags.contains(.command) { revision += 1; onSelection?(nil) }
-        case .scrollWheel: revision += 1; pending?.cancel(); onScroll?()
+            if event.keyCode == 53 { (onCancel ?? onScroll)?() }
+            else if !event.modifierFlags.contains(.shift) && !event.modifierFlags.contains(.command) { invalidateInternalRead(); onSelection?(nil) }
+        case .scrollWheel: invalidateInternalRead(); onScroll?()
         default: break
         }
     }
     func schedule() {
-        revision += 1; pending?.cancel()
+        guard !modelMenuTracking, !awaitingExternalInputAfterMenu else { return }
+        if Self.isLeftMouseDown { invalidateInternalRead(); return }
+        if isInternalInteraction?(NSEvent.mouseLocation) == true { invalidateInternalRead(); return }
+        revision += 1
         guard enabled, AXIsProcessTrusted() else { return }
-        let work = DispatchWorkItem { [weak self] in self?.read() }
-        pending = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16, execute: work)
+        readRequested = true
+        read()
     }
     private func read() {
-        guard enabled, !readInFlight, let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return }
+        guard readRequested, enabled, !modelMenuTracking, !awaitingExternalInputAfterMenu,
+              !readInFlight, !Self.isLeftMouseDown,
+              let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return }
+        readRequested = false
         readInFlight = true
-        let ticket = revision; let pid = app.processIdentifier
+        let ticket = revision; let epoch = interactionEpoch; let pid = app.processIdentifier
         let mouse = CGEvent(source: nil)?.location ?? .zero
         readQueue.async { [weak self] in
             let snapshot = SelectionReader.read(pid: pid, mouse: mouse)
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.readInFlight = false
-                guard self.enabled, self.revision == ticket, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
-                    if self.enabled, self.revision != ticket { self.schedule() }
+                // Coalesce new events during the AX read into one immediate
+                // read of the latest selection, without a debounce timer.
+                defer { self.read() }
+                if Self.isLeftMouseDown { self.invalidateInternalRead(); return }
+                guard !self.modelMenuTracking, !self.awaitingExternalInputAfterMenu,
+                      self.isInternalInteraction?(NSEvent.mouseLocation) != true else { return }
+                guard self.enabled, self.revision == ticket, self.interactionEpoch == epoch,
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
                     return
                 }
                 self.onSelection?(snapshot)
             }
         }
     }
+    private func invalidateInternalRead() {
+        interactionEpoch += 1; revision += 1; readRequested = false
+    }
     func stop() {
-        revision += 1
-        pending?.cancel()
+        invalidateInternalRead()
         if let global = global { NSEvent.removeMonitor(global) }; global = nil
         if let local = local { NSEvent.removeMonitor(local) }; local = nil
         if let activation = activation { NSWorkspace.shared.notificationCenter.removeObserver(activation) }; activation = nil

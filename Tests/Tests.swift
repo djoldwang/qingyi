@@ -11,8 +11,8 @@ struct QingyiTests {
         do { try body(); passed += 1; print("PASS \(name)") }
         catch { failed += 1; print("FAIL \(name): \(error)") }
     }
-    static func expect(_ condition: @autoclosure () -> Bool, _ message: String = "assertion failed") throws {
-        if !condition() { throw QingyiError.message(message) }
+    static func expect(_ condition: @autoclosure () throws -> Bool, _ message: String = "assertion failed") throws {
+        if try !condition() { throw QingyiError.message(message) }
     }
     static func rejects(_ body: () throws -> Void) throws {
         do { try body() } catch { return }
@@ -25,6 +25,21 @@ struct QingyiTests {
     }
     @MainActor static func main() async {
         setbuf(stdout, nil)
+        if CommandLine.arguments.contains("--native-settings") || Bundle.main.bundleIdentifier == "com.laowang.qingyi.settings-tests" {
+            runNativeSettingsFixture(); return
+        }
+        if CommandLine.arguments.contains("--native-model-menu") || Bundle.main.bundleIdentifier?.hasPrefix("com.laowang.qingyi.model-menu-tests") == true {
+            runNativeModelMenuFixture(); return
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--ui-snapshots"), CommandLine.arguments.count > index + 1 {
+            do { try renderCustomUI(to: CommandLine.arguments[index + 1]); print("PASS UI snapshots rendered with fixture data") }
+            catch { print("FAIL UI snapshots: \(error)"); exit(1) }
+            return
+        }
+        await customAPITests()
+        await temporaryModelTests()
+        settingsTests()
+        await releaseTests()
         check("RFC 7636 PKCE vector") {
             try expect(pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
         }
@@ -42,6 +57,25 @@ struct QingyiTests {
             try expect(TextPolicy.needsTranslation("Please send the document."))
             try expect(TextPolicy.needsTranslation("これは日本語の文章です。"))
             try expect(TextPolicy.needsTranslation("ChatGPT"))
+        }
+        check("Standalone URLs, bare domains and common opaque URIs are excluded from automatic selection") {
+            for address in ["https://example.com", "HTTP://example.com/a?q=1#part", "https://example.com/中文路径?q=%E4%B8%AD", "example.com", "www.example.com/a", "ftp://example.com/file", "file:///tmp/document.txt", "smb://server/share", "vscode://file/tmp/a.swift", "myapp://open?id=1", "mailto:user@example.com", "tel:+8613800000000", "sms:+8613800000000", "urn:isbn:9780306406157", "data:text/plain;base64,SGVsbG8=", "geo:31.2,121.4", "magnet:?xt=urn:btih:abcdef", " \nhttps://example.com\t"] {
+                try expect(TextPolicy.isStandaloneAddress(address), "Not recognized: \(address)")
+                try expect(!TextPolicy.shouldOfferAutomaticTranslation(address), "Automatic entry offered: \(address)")
+            }
+        }
+        check("Sentences containing links and ordinary colon text remain automatically translatable") {
+            for text in ["Please read https://example.com", "Visit example.com for details.", "Note:hello", "Meeting:tomorrow", "This is a simple sentence.", "example.com is useful", "https://example.com\nPlease check this"] {
+                try expect(!TextPolicy.isStandaloneAddress(text), "Misclassified as address: \(text)")
+                try expect(TextPolicy.shouldOfferAutomaticTranslation(text), "Ordinary text filtered: \(text)")
+            }
+        }
+        check("Manual translation still accepts addresses and retains its existing validation rules") {
+            for text in ["https://example.com/a?q=1", "example.com", "urn:isbn:9780306406157"] {
+                try expect(try TextPolicy.validate(text) == text)
+            }
+            try rejects { _ = try TextPolicy.validate("这段文字已经是中文。") }
+            try expect(!TextPolicy.shouldOfferAutomaticTranslation("这段文字已经是中文。"))
         }
         check("Empty and overlong text rejected") {
             try rejects { _ = try TextPolicy.validate(" \n") }

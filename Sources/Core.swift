@@ -8,6 +8,29 @@ enum QingyiError: LocalizedError {
     var errorDescription: String? { if case .message(let value) = self { return value }; return nil }
 }
 
+enum CredentialWait {
+    static func value<T>(_ task: Task<T, Error>, timeout: UInt64 = 15_000_000_000) async throws -> T {
+        let stream = AsyncThrowingStream<T, Error>(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let waiter = Task {
+                do { continuation.yield(try await task.value); continuation.finish() }
+                catch { continuation.finish(throwing: error) }
+            }
+            let timer = Task {
+                do {
+                    try await Task.sleep(nanoseconds: timeout)
+                    continuation.finish(throwing: QingyiError.message("macOS 钥匙串访问尚未完成。请确认登录钥匙串已解锁，或处理系统访问提示后重试。"))
+                } catch { }
+            }
+            continuation.onTermination = { _ in waiter.cancel(); timer.cancel() }
+        }
+        var iterator = stream.makeAsyncIterator()
+        let value = try await iterator.next()
+        try Task.checkCancellation()
+        guard let value = value else { throw CancellationError() }
+        return value
+    }
+}
+
 extension Data {
     var base64URL: String { base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "") }
     init?(base64URL: String) {
@@ -31,9 +54,42 @@ func formBody(_ fields: [String: String]) -> Data {
     }.joined(separator: "&").utf8)
 }
 
+enum AppVersion {
+    static var display: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.1" }
+    static var menuTitle: String { "轻译 \(display)" }
+}
+
 enum TextPolicy {
     static let maximumLength = 12_000
+    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+    private static let opaqueURISchemes: Set<String> = ["mailto", "tel", "sms", "urn", "data", "geo", "magnet"]
     static func clean(_ text: String) -> String { text.trimmingCharacters(in: .whitespacesAndNewlines) }
+    static func isStandaloneAddress(_ raw: String) -> Bool {
+        let text = clean(raw)
+        guard !text.isEmpty, !text.contains(where: { $0.isWhitespace }) else { return false }
+        if let components = URLComponents(string: text), let scheme = components.scheme?.lowercased() {
+            let hierarchical = text.lowercased().hasPrefix(scheme + "://")
+            if hierarchical || opaqueURISchemes.contains(scheme) {
+                // URLComponents validates the scheme and escaping; a scheme by
+                // itself is not an address. Do not classify arbitrary label:value.
+                let remainder = text.dropFirst(scheme.count + 1)
+                let needsHost = ["http", "https", "ftp", "ftps", "ws", "wss"].contains(scheme)
+                if !remainder.isEmpty, remainder != "//", components.url != nil,
+                   !needsHost || components.host?.isEmpty == false { return true }
+            }
+        }
+        let whole = NSRange(text.startIndex..., in: text)
+        guard let match = linkDetector?.firstMatch(in: text, range: whole), match.range == whole else { return false }
+        return match.url != nil
+    }
+    static func shouldOfferAutomaticTranslation(_ text: String) -> Bool {
+        let text = clean(text)
+        // Punctuation, symbols and emoji alone have no text to translate.
+        // Keep digits meaningful here; manual translation uses validate instead.
+        guard text.contains(where: { $0.isLetter || $0.isNumber }) else { return false }
+        if text.count == 1, text.first?.isLetter == true { return false }
+        return !isStandaloneAddress(text) && needsTranslation(text)
+    }
     static func needsTranslation(_ text: String) -> Bool {
         let text = clean(text)
         guard !text.isEmpty else { return false }
@@ -138,7 +194,7 @@ enum CredentialStore {
         guard loaded == value else { throw QingyiError.message("钥匙串读写检查未通过，请退出轻译后重新打开。") }
         try remove(account: account)
     }
-    static func read<T: Decodable>(_ type: T.Type, account: String) throws -> T? {
+    static func read<T: Decodable>(_ type: T.Type, account: String, service: String = CredentialStore.service) throws -> T? {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
@@ -146,7 +202,7 @@ enum CredentialStore {
         guard status == errSecSuccess, let data = result as? Data else { throw failure("读取", status: status) }
         return try JSONDecoder().decode(type, from: data)
     }
-    static func save<T: Encodable>(_ value: T, account: String) throws {
+    static func save<T: Encodable>(_ value: T, account: String, service: String = CredentialStore.service, label: String = "轻译 ChatGPT 登录") throws {
         let data = try JSONEncoder().encode(value)
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
         let status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
@@ -156,12 +212,12 @@ enum CredentialStore {
             // Local ad-hoc builds use the macOS login keychain's app ACL. Data-protection
             // keychain access groups require a provisioned signing identity; do not request
             // those entitlements or silently fall back to a plaintext file.
-            addition[kSecAttrLabel as String] = "轻译 ChatGPT 登录"
+            addition[kSecAttrLabel as String] = label
             let added = SecItemAdd(addition as CFDictionary, nil)
             guard added == errSecSuccess else { throw failure("保存", status: added) }
         } else if status != errSecSuccess { throw failure("更新", status: status) }
     }
-    static func remove(account: String) throws {
+    static func remove(account: String, service: String = CredentialStore.service) throws {
         let status = SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account] as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw failure("删除", status: status) }
     }
