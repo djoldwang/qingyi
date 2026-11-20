@@ -7,7 +7,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .selection: return "划词翻译"
+        case .selection: return "翻译触发"
         case .window: return "译文窗口"
         case .services: return "翻译服务"
         case .general: return "通用"
@@ -69,9 +69,11 @@ final class SettingsNavigation: NSObject, ObservableObject, NSWindowDelegate {
 
 struct SettingsPermissionPresentation {
     let trusted: Bool
+    var name = "辅助功能"
+    var purpose = "读取选中文字及悬停段落"
     var action: String { trusted ? "管理系统权限" : "获取系统权限" }
-    var status: String { trusted ? "辅助功能 · 已授权" : "辅助功能 · 未授权" }
-    var help: String { "前往系统设置 → 隐私与安全性 → 辅助功能，\(trusted ? "管理" : "开启")轻译读取选中文字的权限。" }
+    var status: String { "\(name) · \(trusted ? "已授权" : "未授权")" }
+    var help: String { "前往系统设置 → 隐私与安全性 → \(name)，\(trusted ? "管理" : "开启")轻译\(purpose)的权限。" }
 }
 
 enum SettingsLayout {
@@ -126,6 +128,8 @@ struct SettingsView: View {
     var loadsAccounts = true
     var apiClient = CustomAPIClient()
     var requestSystemPermission: (() -> Void)? = nil
+    var updateScreenshotShortcut: ((ShortcutBinding) -> Bool)? = nil
+    var requestScreenCapturePermission: (() -> Void)? = nil
     @ViewState<Bool> private var choosingExcludedApps = false
     @ViewState<String> private var exclusionMessage = ""
     @ViewState<Registration?> private var accountToDelete = nil
@@ -216,47 +220,56 @@ struct SettingsView: View {
             permissionButton
             Text(AppVersion.display)
                 .font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 6).padding(.top, 12)
-            Text("原生 macOS 划词翻译").font(.system(size: 10)).foregroundStyle(.secondary)
+            Text("原生 macOS 翻译工具").font(.system(size: 10)).foregroundStyle(.secondary)
                 .padding(.horizontal, 6).padding(.top, 2).padding(.bottom, 18)
         }.padding(.horizontal, 12).frame(width: 190)
             .background(Color(nsColor: .underPageBackgroundColor).opacity(0.5))
     }
 
     private var permissionButton: some View {
-        let presentation = SettingsPermissionPresentation(trusted: preferences.trusted)
-        let color: Color = preferences.trusted ? accent : .orange
-        return Button {
-            if let requestSystemPermission = requestSystemPermission { requestSystemPermission() }
-            else { preferences.requestAccessibility() }
-        } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(presentation.action).font(.system(size: 12, weight: .semibold)).foregroundStyle(color)
-                HStack(spacing: 5) {
-                    Image(systemName: preferences.trusted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(preferences.trusted ? Color.green : color)
-                    Text(presentation.status).foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
-                    Image(systemName: "chevron.right").foregroundStyle(color)
-                }.font(.system(size: 10))
-            }.padding(11).frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-        }.buttonStyle(.plain)
+        let color: Color = preferences.trusted && preferences.screenCaptureGranted ? accent : .orange
+        return VStack(alignment: .leading, spacing: 3) {
+            Text("系统权限").font(.system(size: 12, weight: .semibold)).foregroundStyle(color)
+                .padding(.bottom, 4)
+            permissionRow(SettingsPermissionPresentation(trusted: preferences.trusted), identifier: "settings.system-permission") {
+                if let requestSystemPermission = requestSystemPermission { requestSystemPermission() }
+                else { preferences.requestAccessibility() }
+            }
+            permissionRow(SettingsPermissionPresentation(trusted: preferences.screenCaptureGranted, name: "屏幕录制", purpose: "截取屏幕文字进行翻译"), identifier: "settings.screenshot.permission") {
+                requestScreenCapturePermission?()
+            }
+        }.padding(11).frame(maxWidth: .infinity, alignment: .leading)
             .background(color.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
             .overlay(RoundedRectangle(cornerRadius: 7).stroke(color.opacity(0.35), lineWidth: 1))
+    }
+
+    private func permissionRow(_ presentation: SettingsPermissionPresentation, identifier: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: presentation.trusted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .foregroundStyle(presentation.trusted ? Color.green : .orange)
+                Text(presentation.status).foregroundStyle(.secondary).lineLimit(1)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right").foregroundStyle(.secondary)
+            }.font(.system(size: 10)).padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+        }.buttonStyle(.plain)
             .help(presentation.help)
-            .accessibilityLabel("\(presentation.action)，\(presentation.status)")
-            .accessibilityIdentifier("settings.system-permission")
+            .accessibilityLabel("\(presentation.name)，\(presentation.trusted ? "已授权，管理权限" : "未授权，获取权限")")
+            .accessibilityIdentifier(identifier)
     }
 
     private var selectionSettings: some View {
         Group {
-            SettingsGroup(title: "划词行为") {
+            SettingsGroup(title: "划词翻译") {
                 SettingsRow {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("暂停自动划词")
-                        hint("暂停后不显示“译”按钮，剪贴板翻译仍可使用。")
+                        Text("启用划词翻译")
+                        hint("关闭后不显示“译”按钮，悬停翻译和剪贴板翻译独立控制。")
                     }
                     Spacer()
-                    Toggle("暂停自动划词", isOn: $preferences.paused).labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
+                    Toggle("启用划词翻译", isOn: $preferences.selectionEnabled).labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
+                        .accessibilityIdentifier("settings.selection.enabled")
                 }
                 Divider()
                 SettingsRow {
@@ -264,14 +277,16 @@ struct SettingsView: View {
                     Picker("划词按钮位置", selection: $preferences.buttonPosition) {
                         ForEach(ButtonPosition.allCases) { Text($0.title).tag($0) }
                     }.labelsHidden().settingsControlColumn().help(preferences.buttonPosition.title)
+                        .disabled(preferences.paused)
                 }
+                SettingsRow { hint("松手后读取选区，显示“译”按钮。鼠标移入或点击按钮即可翻译。") }
             }
-            hint("松手后读取选区，显示“译”按钮。鼠标移入或点击按钮即可翻译。")
-            SettingsGroup(title: "已排除的软件") {
+            hoverSettings
+            SettingsGroup(title: "排除应用") {
                 SettingsRow {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(preferences.excluded.isEmpty ? "未排除任何软件" : "已排除 \(preferences.excluded.count) 个软件")
-                        hint("添加应用后，将暂停在这些应用中自动划词。")
+                        hint("添加应用后，将暂停这些应用的自动划词和悬停翻译，不影响剪贴板翻译。")
                     }
                     Spacer()
                     Button { choosingExcludedApps = true } label: { Label("添加应用…", systemImage: "plus") }.settingsAction()
@@ -288,7 +303,7 @@ struct SettingsView: View {
                                 Spacer()
                                 Button("移除") {
                                     preferences.removeExclusion(id); exclusionMessage = ""
-                                }.settingsAction().accessibilityLabel("将 \(applicationName(id)) 移出排除列表，恢复自动划词")
+                                }.settingsAction().accessibilityLabel("将 \(applicationName(id)) 移出排除列表，恢复自动划词及悬停翻译")
                             }
                         }
                     }
@@ -302,6 +317,40 @@ struct SettingsView: View {
             }
             if !exclusionMessage.isEmpty { hint(exclusionMessage) }
             hint("部分软件无法读取选区，可复制文字后使用快捷键翻译。")
+        }
+    }
+
+    private var hoverSettings: some View {
+        Group {
+            SettingsGroup(title: "悬停翻译") {
+                SettingsRow {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("启用悬停翻译")
+                        hint("无需选中文字，触发后直接显示当前段落的译文。")
+                    }
+                    Spacer()
+                    Toggle("启用悬停翻译", isOn: $preferences.hoverEnabled)
+                        .labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
+                        .accessibilityIdentifier("settings.hover.enabled")
+                }
+                Divider()
+                SettingsRow {
+                    Text("触发方式").fixedSize(); Spacer()
+                    Picker("触发方式", selection: $preferences.hoverTrigger) {
+                        ForEach(HoverTrigger.allCases) { Text($0.title).tag($0) }
+                    }.labelsHidden().settingsControlColumn()
+                        .accessibilityIdentifier("settings.hover.trigger")
+                        .disabled(!preferences.hoverEnabled)
+                }
+                SettingsRow {
+                    VStack(alignment: .leading, spacing: 6) {
+                        hint(preferences.hoverTrigger == .longPress
+                             ? "将鼠标放在段落上，按住左键 0.6 秒即可翻译。移动超过 6 点会取消触发，正常拖选不受影响。"
+                             : "将鼠标放在段落上，单独按下并松开所选按键即可翻译；组合按键、鼠标点击或移动会取消触发。")
+                        hint("默认关闭，开启后与自动划词独立工作。中文自动跳过，不显示译文窗口。")
+                    }
+                }
+            }
         }
     }
 
@@ -347,7 +396,16 @@ struct SettingsView: View {
                     ShortcutRecorder(binding: preferences.shortcutBinding, onCandidate: updateShortcut, onRecording: shortcutRecording)
                         .frame(width: 185, height: 28).settingsControlColumn()
                 }
+                Divider()
+                SettingsRow {
+                    VStack(alignment: .leading, spacing: 3) { Text("截图翻译"); hint("松开快捷键后框选，自动识别并翻译。") }
+                    Spacer()
+                    ShortcutRecorder(binding: preferences.screenshotShortcutBinding, actionName: "截图翻译", onCandidate: { updateScreenshotShortcut?($0) ?? false }, onRecording: shortcutRecording)
+                        .frame(width: 185, height: 28).settingsControlColumn()
+                        .accessibilityIdentifier("settings.screenshot.shortcut")
+                }
             }
+            if !preferences.screenshotShortcutMessage.isEmpty { Text(preferences.screenshotShortcutMessage).font(.caption).foregroundStyle(.orange) }
             hint("录制时按 Esc 取消。快捷键冲突时保留原组合，并在此处提示。")
             if !preferences.shortcutMessage.isEmpty { Text(preferences.shortcutMessage).font(.caption).foregroundStyle(.orange) }
         }
@@ -480,14 +538,16 @@ struct SettingsView: View {
                 hint(AppVersion.display)
             }.frame(maxWidth: .infinity).padding(.bottom, 4)
             SettingsGroup(title: "隐私与数据") {
-                privacyRow("主动触发，才发送待翻译文字", "文字发送给你选择的翻译服务，划词检测在本机完成。")
+                privacyRow("主动触发，才发送待翻译文字", "文字发送给你选择的翻译服务，划词检测与截图文字识别在本机完成。")
                 Divider()
                 privacyRow("默认不保存翻译历史", "默认不保存原文、译文或翻译历史。")
                 Divider()
                 privacyRow("凭据保存在 macOS 钥匙串", "账号及模型配置保存在本机。")
             }
             SettingsGroup(title: "当前能力") {
-                SettingsRow { hint("翻译为简体中文，单次最多 12,000 字。暂不支持图片、截图及扫描件识别。") }
+                SettingsRow { hint("支持划词、悬停、剪贴板及截图翻译。外语译为简体中文，单次最多 12,000 字。") }
+                Divider()
+                SettingsRow { hint("图片及扫描件可通过截图识别后翻译。文字在本机识别，仅将识别出的文字发送给当前翻译服务。") }
             }
         }
     }
@@ -502,7 +562,7 @@ struct SettingsView: View {
     }
     private func restoreAccount() {
         guard loadsAccounts else { return }
-        chat.restore()
+        chat.restoreForSettings()
         if chat.signedIn, chat.models.isEmpty { refreshModels() }
     }
     private func refreshModels() {

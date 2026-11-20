@@ -124,7 +124,25 @@ enum SelectionReader {
 
 final class SelectionMonitor {
     static var isLeftMouseDown: Bool { NSEvent.pressedMouseButtons & 1 != 0 }
+    private(set) var screenshotSuspended = false
+    private(set) var screenshotAwaitingFreshInput = false
+    func setScreenshotSuspended(_ value: Bool) {
+        screenshotSuspended = value; invalidateInternalRead()
+        if !value {
+            ignoreEventsThrough = ProcessInfo.processInfo.systemUptime
+            screenshotAwaitingFreshInput = true
+            hoverOwnsSelection = true
+        }
+    }
     var onSelection: ((SelectionSnapshot?) -> Void)?
+    var onExternalEvent: ((NSEvent) -> Bool)?
+    var onContextChanged: (() -> Void)?
+    var onInternalEvent: (() -> Void)?
+    private(set) var hoverOwnsSelection = false
+    func suppressAutomaticSelectionForHover() {
+        hoverOwnsSelection = true; invalidateInternalRead()
+    }
+
     var onOutsideClick: ((NSPoint) -> Void)?
     var onScroll: (() -> Void)?
     var onCancel: (() -> Void)?
@@ -156,9 +174,11 @@ final class SelectionMonitor {
     private let readQueue = DispatchQueue(label: "com.laowang.qingyi.selection", qos: .userInitiated)
 
     func start() {
-        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseUp, .keyUp, .keyDown, .scrollWheel]
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .otherMouseDown, .leftMouseDragged, .mouseMoved, .flagsChanged, .keyUp, .keyDown, .scrollWheel]
         global = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] in self?.event($0) }
-        local = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { [weak self] event in
+        local = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged, .leftMouseDown]) { [weak self] event in
+            if self?.screenshotSuspended == true { return event }
+            self?.onInternalEvent?()
             if let self = self, event.type == .keyDown, event.keyCode == 53, self.modelMenuTracking {
                 self.onMenuCancel?(); return nil
             }
@@ -168,8 +188,9 @@ final class SelectionMonitor {
         }
         activation = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
             self?.invalidateInternalRead()
+            self?.onContextChanged?()
             let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            if self?.modelMenuTracking == false, self?.awaitingExternalInputAfterMenu == false,
+            if self?.modelMenuTracking == false, self?.awaitingExternalInputAfterMenu == false, self?.screenshotSuspended == false, self?.screenshotAwaitingFreshInput == false,
                app?.processIdentifier != getpid() { self?.onSelection?(nil) }
             self?.attachObserver()
         }
@@ -193,15 +214,25 @@ final class SelectionMonitor {
         observer = created; observedApp = element
     }
     func event(_ event: NSEvent) {
+        guard !screenshotSuspended else { return }
         if modelMenuTracking {
+            onInternalEvent?()
             if event.type == .keyDown, event.keyCode == 53 { onMenuCancel?() }
             return
         }
         guard event.timestamp > ignoreEventsThrough else { return }
+        if screenshotAwaitingFreshInput {
+            let newGesture = [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown, .scrollWheel, .mouseMoved].contains(event.type)
+                || (event.type == .flagsChanged && !event.modifierFlags.intersection([.control, .command, .shift, .option]).isEmpty)
+            guard newGesture else { return }
+            screenshotAwaitingFreshInput = false
+        }
         awaitingExternalInputAfterMenu = false
         if !(event.type == .keyDown && event.keyCode == 53), isInternalInteraction?(NSEvent.mouseLocation) == true {
-            invalidateInternalRead(); return
+            onInternalEvent?(); invalidateInternalRead(); return
         }
+        if [.leftMouseDown, .keyDown, .scrollWheel].contains(event.type) { hoverOwnsSelection = false }
+        if onExternalEvent?(event) == true { return }
         switch event.type {
         case .leftMouseDown:
             // A new drag invalidates both queued and in-flight selection reads,
@@ -218,7 +249,7 @@ final class SelectionMonitor {
         }
     }
     func schedule() {
-        guard !modelMenuTracking, !awaitingExternalInputAfterMenu else { return }
+        guard !screenshotSuspended, !screenshotAwaitingFreshInput, !hoverOwnsSelection, !modelMenuTracking, !awaitingExternalInputAfterMenu else { return }
         if Self.isLeftMouseDown { invalidateInternalRead(); return }
         if isInternalInteraction?(NSEvent.mouseLocation) == true { invalidateInternalRead(); return }
         revision += 1
@@ -227,7 +258,7 @@ final class SelectionMonitor {
         read()
     }
     private func read() {
-        guard readRequested, enabled, !modelMenuTracking, !awaitingExternalInputAfterMenu,
+        guard !screenshotSuspended, !screenshotAwaitingFreshInput, readRequested, enabled, !hoverOwnsSelection, !modelMenuTracking, !awaitingExternalInputAfterMenu,
               !readInFlight, !Self.isLeftMouseDown,
               let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return }
         readRequested = false
@@ -243,7 +274,7 @@ final class SelectionMonitor {
                 // read of the latest selection, without a debounce timer.
                 defer { self.read() }
                 if Self.isLeftMouseDown { self.invalidateInternalRead(); return }
-                guard !self.modelMenuTracking, !self.awaitingExternalInputAfterMenu,
+                guard !self.screenshotSuspended, !self.screenshotAwaitingFreshInput, !self.modelMenuTracking, !self.awaitingExternalInputAfterMenu,
                       self.isInternalInteraction?(NSEvent.mouseLocation) != true else { return }
                 guard self.enabled, self.revision == ticket, self.interactionEpoch == epoch,
                       NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
@@ -270,10 +301,46 @@ struct ShortcutBinding: Codable, Equatable {
     let key: UInt32
     let modifiers: UInt32
     let keyName: String
+    static let defaultScreenshot = ShortcutBinding(key: 1, modifiers: UInt32(controlKey | cmdKey | shiftKey), keyName: "S")
     static let defaultClipboard = ShortcutBinding(key: 17, modifiers: UInt32(controlKey | cmdKey | shiftKey), keyName: "T")
     static let legacyDefault = ShortcutBinding(key: 17, modifiers: UInt32(optionKey | shiftKey), keyName: "T")
     func sameChord(as other: ShortcutBinding) -> Bool { key == other.key && modifiers == other.modifiers }
     var display: String { Self.modifierLabel(modifiers) + keyName }
+    // AppKit uses control characters / function-key scalars in its native
+    // menu shortcut column, rather than the human-readable recorder labels.
+    var menuKeyEquivalent: String? {
+        let special: [UInt32: UInt32] = [36: 0x0d, 48: 0x09, 49: 0x20, 51: 0x08, 53: 0x1b,
+            71: 0xf739, 76: 0x03, 117: 0xf728, 115: 0xf729, 119: 0xf72b,
+            116: 0xf72c, 121: 0xf72d, 123: 0xf702, 124: 0xf703, 125: 0xf701, 126: 0xf700]
+        if let scalar = special[key].flatMap(UnicodeScalar.init) { return String(scalar) }
+        let functionKeys: [UInt32] = [122,120,99,118,96,97,98,100,101,109,103,111,105,107,113,106,64,79,80,90]
+        if let index = functionKeys.firstIndex(of: key), let scalar = UnicodeScalar(0xf704 + index) { return String(scalar) }
+        let name = keyName.replacingOccurrences(of: "小键盘 ", with: "")
+        return name.count == 1 ? name.lowercased() : nil
+    }
+    var menuModifierMask: NSEvent.ModifierFlags {
+        var flags: NSEvent.ModifierFlags = []
+        if modifiers & UInt32(controlKey) != 0 { flags.insert(.control) }
+        if modifiers & UInt32(cmdKey) != 0 { flags.insert(.command) }
+        if modifiers & UInt32(shiftKey) != 0 { flags.insert(.shift) }
+        if modifiers & UInt32(optionKey) != 0 { flags.insert(.option) }
+        if [65,67,69,75,78,81,82,83,84,85,86,87,88,89,91,92,76].contains(key) { flags.insert(.numericPad) }
+        return flags
+    }
+    static func showMenuShortcut(on item: NSMenuItem, binding: ShortcutBinding?) {
+        guard let binding = binding else {
+            item.title += "（快捷键不可用）"
+            item.toolTip = "全局快捷键未生效，可从此菜单使用，或在设置 → 通用 → 快捷键中重新录制。"
+            return
+        }
+        item.toolTip = binding.display
+        if let key = binding.menuKeyEquivalent {
+            item.keyEquivalent = key
+            item.keyEquivalentModifierMask = binding.menuModifierMask
+        } else {
+            item.title += "    " + binding.display
+        }
+    }
     static func modifierLabel(_ modifiers: UInt32) -> String {
         [(UInt32(controlKey), "⌃"), (UInt32(optionKey), "⌥"), (UInt32(cmdKey), "⌘"), (UInt32(shiftKey), "⇧")].filter { modifiers & $0.0 != 0 }.map(\.1).joined()
     }
@@ -305,6 +372,12 @@ struct ShortcutBinding: Codable, Equatable {
 struct ShortcutPreferences {
     let defaults: UserDefaults
     static let storageKey = "clipboardShortcutBinding"
+    var screenshot: ShortcutBinding {
+        guard let data = defaults.data(forKey: "screenshotShortcutBinding"),
+              let binding = try? JSONDecoder().decode(ShortcutBinding.self, from: data) else { return .defaultScreenshot }
+        return binding
+    }
+    func saveScreenshot(_ binding: ShortcutBinding) { defaults.set(try? JSONEncoder().encode(binding), forKey: "screenshotShortcutBinding") }
     var saved: ShortcutBinding? {
         guard let data = defaults.data(forKey: Self.storageKey) else { return nil }
         return try? JSONDecoder().decode(ShortcutBinding.self, from: data)

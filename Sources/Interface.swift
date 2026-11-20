@@ -43,7 +43,17 @@ final class Preferences: ObservableObject {
     @Published var buttonPosition: ButtonPosition {
         didSet { defaults.set(buttonPosition.rawValue, forKey: "selectionButtonPosition") }
     }
+    @Published var hoverEnabled: Bool {
+        didSet { defaults.set(hoverEnabled, forKey: "hoverTranslationEnabled") }
+    }
+    @Published var hoverTrigger: HoverTrigger {
+        didSet { defaults.set(hoverTrigger.rawValue, forKey: "hoverTranslationTrigger") }
+    }
     @Published var paused = false
+    var selectionEnabled: Bool {
+        get { !paused }
+        set { paused = !newValue }
+    }
     @Published var translationWindowPosition: TranslationWindowPosition {
         didSet { defaults.set(translationWindowPosition.rawValue, forKey: "translationWindowPosition") }
     }
@@ -53,6 +63,9 @@ final class Preferences: ObservableObject {
     @Published var trusted = AXIsProcessTrusted()
     @Published var shortcutBinding: ShortcutBinding
     let shortcutStore: ShortcutPreferences
+    @Published var screenshotShortcutBinding: ShortcutBinding
+    @Published var screenshotShortcutMessage = ""
+    @Published var screenCaptureGranted = CGPreflightScreenCaptureAccess()
     @Published var shortcutMessage = ""
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var generalMessage = ""
@@ -60,6 +73,8 @@ final class Preferences: ObservableObject {
     private var excludedAppLocations: [String: String]
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        hoverEnabled = defaults.bool(forKey: "hoverTranslationEnabled")
+        hoverTrigger = HoverTrigger(rawValue: defaults.string(forKey: "hoverTranslationTrigger") ?? "") ?? .longPress
         excludedAppLocations = defaults.dictionary(forKey: "excludedAppLocations") as? [String: String] ?? [:]
         excluded = defaults.stringArray(forKey: "excludedApps") ?? []
         buttonPosition = ButtonPosition(rawValue: defaults.string(forKey: "selectionButtonPosition") ?? "") ?? .lowerLeft
@@ -68,6 +83,7 @@ final class Preferences: ObservableObject {
         translationFontSize = TranslationFontSize.normalized(savedFontSize)
         shortcutStore = ShortcutPreferences(defaults: defaults)
         shortcutBinding = shortcutStore.preferred
+        screenshotShortcutBinding = shortcutStore.screenshot
     }
     @discardableResult func requestAccessibility() -> Bool {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
@@ -133,6 +149,7 @@ final class Preferences: ObservableObject {
 }
 
 final class ShortcutRecorderButton: NSButton {
+    var actionName = "翻译已复制文字" { didSet { setAccessibilityLabel("录制\(actionName)的快捷键") } }
     var binding = ShortcutBinding.defaultClipboard { didSet { if !recording { refreshTitle() } } }
     var onCandidate: ((ShortcutBinding) -> Bool)?
     var onRecording: ((Bool) -> Void)?
@@ -191,10 +208,12 @@ final class ShortcutRecorderButton: NSButton {
 
 struct ShortcutRecorder: NSViewRepresentable {
     let binding: ShortcutBinding
+    var actionName = "翻译已复制文字"
     var onCandidate: (ShortcutBinding) -> Bool
     var onRecording: (Bool) -> Void
     func makeNSView(context: Context) -> ShortcutRecorderButton { ShortcutRecorderButton() }
     func updateNSView(_ view: ShortcutRecorderButton, context: Context) {
+        view.actionName = actionName
         view.binding = binding
         view.onCandidate = onCandidate; view.onRecording = onRecording
     }
@@ -485,6 +504,16 @@ final class FloatingController {
         state.sessionID = UUID(); state.modelSelectionEnabled = false; state.choice = nil; state.defaultChoice = nil
         state.temporaryModel = false; state.modelMenuMessage = ""; state.loadingChatGPTModels = false
         state.pinned = false; manualTopLeft = nil
+    }
+    // Hiding for capture must retain the session, pin, geometry and retry source.
+    func concealForScreenshot() -> Bool {
+        ModelMenuButton.cancelPresentedMenu(); TranslationResultTextView.cancelPresentedMenu()
+        let visible = resultPanel.isVisible
+        hoverButton.cancelHover(); buttonPanel.orderOut(nil); resultPanel.orderOut(nil)
+        return visible
+    }
+    func restoreAfterScreenshot(wasVisible: Bool) {
+        if wasVisible { resultPanel.orderFrontRegardless() }
     }
     func hideButton() { hoverButton.cancelHover(); buttonPanel.orderOut(nil) }
     func fitContent(requireVisible: Bool = true) {

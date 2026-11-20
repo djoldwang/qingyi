@@ -67,6 +67,26 @@ extension QingyiTests {
             _ = state.update(at: 12.1, systemSettingsPID: 200, foregroundPID: 200, hasSystemSettingsWindow: true, sourceAvailable: true)
             try expect(state.update(at: 13, systemSettingsPID: 200, foregroundPID: 300, hasSystemSettingsWindow: nil, sourceAvailable: true) == .cancelled)
         }
+        check("Positive selection toggle shares pause state and leaves hover preferences independent") {
+            let domain = "qingyi-toggle-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: domain)!
+            defer { defaults.removePersistentDomain(forName: domain) }
+            let preferences = Preferences(defaults: defaults)
+            preferences.hoverEnabled = true; preferences.hoverTrigger = .option
+            preferences.buttonPosition = .upperRight
+            preferences.selectionEnabled = false
+            try expect(preferences.paused && preferences.hoverEnabled && preferences.hoverTrigger == .option)
+            preferences.paused = false // Menu pause toggle must update the same setting.
+            try expect(preferences.selectionEnabled)
+            preferences.hoverEnabled = false
+            try expect(preferences.selectionEnabled && preferences.buttonPosition == .upperRight)
+            preferences.paused = true
+            try expect(!preferences.selectionEnabled)
+            preferences.selectionEnabled = true
+            try expect(!preferences.paused && !preferences.hoverEnabled)
+            let reopened = Preferences(defaults: defaults)
+            try expect(!reopened.hoverEnabled && reopened.hoverTrigger == .option && reopened.buttonPosition == .upperRight)
+        }
         check("Settings navigation starts on selection and routes account and non-active API without changing configuration") {
             let navigation = SettingsNavigation()
             try expect(navigation.section == .selection && navigation.detail == nil)

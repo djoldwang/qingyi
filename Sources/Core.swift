@@ -55,7 +55,7 @@ func formBody(_ fields: [String: String]) -> Data {
 }
 
 enum AppVersion {
-    static var display: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.1" }
+    static var display: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.2" }
     static var menuTitle: String { "轻译 \(display)" }
 }
 

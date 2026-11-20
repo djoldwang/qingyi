@@ -12,6 +12,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let floating = FloatingController()
     let monitor = SelectionMonitor()
     let shortcut = GlobalShortcut()
+    let screenshotShortcut = GlobalShortcut()
+    var screenshotCapture: ScreenshotCapturing = NativeScreenshotCapture()
+    var screenshotOCR: ScreenshotRecognizing = VisionScreenshotOCR()
+    var screenCaptureAccess: () -> Bool = { CGPreflightScreenCaptureAccess() }
+    private var screenshotTask: Task<Void, Never>?
+    private var screenshotID: UUID?
+    private var screenshotImage: CGImage?
+    private var screenshotWasVisible = false
+    private var screenshotCapturing = false
+    let hover = HoverMonitor()
+    private let hoverReadQueue = DispatchQueue(label: "com.laowang.qingyi.hover", qos: .userInitiated)
+    private var hoverTicket: HoverReadTicket?
+    private var hoverSessionActive = false
+    private var hoverContext: (pid: pid_t, point: CGPoint)?
     private var statusItem: NSStatusItem!
     private var settingsWindow: NSWindow?
     private let settingsNavigation = SettingsNavigation()
@@ -57,11 +71,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.title = "译"
         statusItem.button?.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
         statusItem.button?.setAccessibilityLabel("轻译菜单")
-        statusItem.button?.toolTip = "轻译 · 划词翻译"
+        statusItem.button?.toolTip = "轻译 · 划词、悬停与截图翻译"
         let menu = NSMenu(); menu.delegate = self; statusItem.menu = menu
         floating.onTrigger = { [weak self] in self?.trigger() }
         floating.onClose = { [weak self] in self?.dismiss() }
-        floating.onRetry = { [weak self] in self?.performTranslation(keepPosition: true) }
+        floating.onRetry = { [weak self] in self?.retryTranslation() }
         floating.onSettings = { [weak self] in self?.dismiss(); self?.showSettings() }
         floating.onModelMenuTracking = { [weak self] tracking in
             guard let self = self else { return }
@@ -80,6 +94,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         floating.onLoadModels = { [weak self] id in self?.loadTemporaryModels(sessionID: id) }
         monitor.onSelection = { [weak self] in self?.selectionChanged($0) }
+        monitor.onExternalEvent = { [weak self] in self?.hover.event($0) ?? false }
+        monitor.onInternalEvent = { [weak self] in self?.hover.cancel() }
+        monitor.onContextChanged = { [weak self] in
+            guard let self = self else { return }
+            guard !self.screenshotCapturing, !self.monitor.screenshotAwaitingFreshInput else { return }
+            self.hover.cancel()
+            if self.hoverSessionActive, !self.floating.state.pinned,
+               NSWorkspace.shared.frontmostApplication?.processIdentifier != getpid() { self.dismiss() }
+        }
+        hover.onCancelRead = { [weak self] in self?.hoverTicket?.cancel(); self?.hoverTicket = nil }
+        hover.permitsTrigger = { [weak self] point in
+            guard let self = self, self.screenshotID == nil, self.preferences.hoverEnabled, self.preferences.trusted,
+                  !self.monitor.modelMenuTracking, self.monitor.isInternalInteraction?(point) != true,
+                  let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return false }
+            return !self.preferences.excluded.contains(app.bundleIdentifier ?? "")
+        }
+        hover.onTrigger = { [weak self] point in self?.translateHoveredParagraph(at: point) }
+        preferences.$hoverEnabled.combineLatest(preferences.$hoverTrigger).sink { [weak self] enabled, trigger in
+            self?.hover.configure(enabled: enabled, trigger: trigger)
+        }.store(in: &subscriptions)
+        preferences.$excluded.dropFirst().sink { [weak self] _ in self?.hover.cancel() }.store(in: &subscriptions)
         monitor.isInternalInteraction = { [weak self] point in
             guard let self = self else { return false }
             // Hit-test the frontmost window rather than its frame: a settings
@@ -90,13 +125,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         monitor.onOutsideClick = { [weak self] point in
             guard let self = self else { return }
-            if !self.floating.state.pinned, !self.floating.contains(point) { self.dismiss() }
+            if !self.screenshotCapturing, !self.floating.state.pinned, !self.floating.contains(point) { self.dismiss() }
         }
-        monitor.onScroll = { [weak self] in if self?.floating.state.pinned == false { self?.dismiss() } }
+        monitor.onScroll = { [weak self] in if self?.screenshotCapturing == false, self?.floating.state.pinned == false { self?.dismiss() } }
         monitor.onCancel = { [weak self] in self?.dismiss() }
         monitor.onMenuCancel = { ModelMenuButton.cancelPresentedMenu(); TranslationResultTextView.cancelPresentedMenu() }
         shortcut.onPress = { [weak self] in self?.translateClipboard() }
+        screenshotShortcut.onPress = { [weak self] in self?.beginScreenshot(binding: self?.preferences.screenshotShortcutBinding) }
         registerShortcut()
+        _ = applyScreenshotShortcut(preferences.screenshotShortcutBinding)
         monitor.start()
         preferences.$translationFontSize.sink { [weak self] size in
             self?.floating.state.fontSize = CGFloat(size)
@@ -104,7 +141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         preferences.$paused.sink { [weak self] value in
             self?.monitor.enabled = !value
             self?.statusItem?.button?.appearsDisabled = value
-            if value, self?.floating.state.pinned == false { self?.dismiss() }
+            if value, self?.screenshotID == nil, self?.floating.state.pinned == false { self?.dismiss() }
         }.store(in: &subscriptions)
         chat.$activeID.dropFirst().sink { [weak self] _ in self?.dismiss() }.store(in: &subscriptions)
         var previouslySignedIn = chat.signedIn
@@ -122,7 +159,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self = self else { return }
             MainActor.assumeIsolated {
                 let trusted = AXIsProcessTrusted()
-                if self.preferences.trusted != trusted { self.preferences.trusted = trusted; self.monitor.stop(); self.monitor.start() }
+                if self.preferences.trusted != trusted { self.preferences.trusted = trusted; self.hover.cancel(); self.monitor.stop(); self.monitor.start() }
+                self.preferences.screenCaptureGranted = self.screenCaptureAccess()
                 if !trusted { self.monitor.enabled = false }
                 else { self.monitor.enabled = !self.preferences.paused }
             }
@@ -136,8 +174,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showSettings(); return true }
     func applicationWillTerminate(_ notification: Notification) {
-        settingsReturn.cancel()
-        permissionTimer?.invalidate(); chat.cancelLogin(); translation?.cancel(); modelLoadingTask?.cancel(); monitor.stop()
+        settingsReturn.cancel(); cancelScreenshot(restore: false)
+        permissionTimer?.invalidate(); chat.cancelLogin(); translation?.cancel(); modelLoadingTask?.cancel(); hover.cancel(); monitor.stop()
     }
     private func configureMainMenu() {
         let menu = NSMenu()
@@ -160,10 +198,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pause = menu.addItem(withTitle: preferences.paused ? "恢复自动划词" : "暂停自动划词", action: #selector(togglePaused), keyEquivalent: "")
         pause.target = self
         let clipboard = menu.addItem(withTitle: "翻译已复制文字", action: #selector(translateClipboard), keyEquivalent: ""); clipboard.target = self
+        let screenshot = menu.addItem(withTitle: "截图翻译", action: #selector(translateScreenshot), keyEquivalent: ""); screenshot.target = self
+        ShortcutBinding.showMenuShortcut(on: clipboard, binding: shortcut.suspended ? nil : shortcut.activeBinding)
+        ShortcutBinding.showMenuShortcut(on: screenshot, binding: screenshotShortcut.suspended ? nil : screenshotShortcut.activeBinding)
         if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid(), let id = app.bundleIdentifier {
             excludedCandidate = (id, app.localizedName ?? id)
             let excluded = preferences.excluded.contains(id)
-            let item = menu.addItem(withTitle: "\(excluded ? "恢复" : "暂停")在 \(app.localizedName ?? id) 中自动划词", action: #selector(toggleExclusion), keyEquivalent: ""); item.target = self
+            let item = menu.addItem(withTitle: "\(excluded ? "恢复" : "暂停")在 \(app.localizedName ?? id) 中划词及悬停翻译", action: #selector(toggleExclusion), keyEquivalent: ""); item.target = self
         } else { excludedCandidate = nil }
         menu.addItem(.separator())
         let settings = menu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ","); settings.target = self
@@ -181,13 +222,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         presentSettings(.about)
     }
     private func presentSettings(_ section: SettingsSection) {
-        if api.activeProviderID.isEmpty { chat.restore() }
+        if api.activeProviderID.isEmpty { chat.restoreForSettings() }
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 680), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.title = "轻译设置"; window.isReleasedWhenClosed = false; window.contentMinSize = NSSize(width: 780, height: 600)
             window.hidesOnDeactivate = false
             window.delegate = settingsNavigation
-            window.contentView = NSHostingView(rootView: SettingsView(preferences: preferences, chat: chat, api: api, navigation: settingsNavigation, updateShortcut: { [weak self] binding in self?.applyShortcut(binding) ?? false }, shortcutRecording: { [weak self] recording in self?.setShortcutRecording(recording) }, preview: { [weak self] in self?.showPreview() }, verify: { [weak self] in self?.verifyTranslation() }, requestSystemPermission: { [weak self] in self?.openSystemPermissions() }))
+            window.contentView = NSHostingView(rootView: SettingsView(preferences: preferences, chat: chat, api: api, navigation: settingsNavigation, updateShortcut: { [weak self] binding in self?.applyShortcut(binding) ?? false }, shortcutRecording: { [weak self] recording in self?.setShortcutRecording(recording) }, preview: { [weak self] in self?.showPreview() }, verify: { [weak self] in self?.verifyTranslation() }, requestSystemPermission: { [weak self] in self?.openSystemPermissions() }, updateScreenshotShortcut: { [weak self] in self?.applyScreenshotShortcut($0) ?? false }, requestScreenCapturePermission: { [weak self] in self?.manageScreenCapturePermission() }))
             window.center(); settingsWindow = window
         }
         settingsNavigation.open(section)
@@ -199,7 +240,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settingsReturn.begin(window: settingsWindow)
         if !preferences.requestAccessibility() { settingsReturn.cancel() }
     }
+    private var registeringInitialShortcut = false
     func registerShortcut() {
+        registeringInitialShortcut = true
+        defer { registeringInitialShortcut = false }
         let preferred = preferences.shortcutBinding
         // Keep the existing default alive until its replacement has registered.
         if let fallback = preferences.shortcutStore.migrationFallback { _ = shortcut.register(fallback) }
@@ -210,6 +254,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     @discardableResult func applyShortcut(_ binding: ShortcutBinding) -> Bool {
+        guard registeringInitialShortcut || !binding.sameChord(as: preferences.screenshotShortcutBinding) else {
+            preferences.shortcutMessage = "该组合已用于截图翻译，原快捷键未更改。"; return false
+        }
         let status = shortcut.register(binding)
         if status == noErr {
             preferences.shortcutBinding = binding
@@ -221,12 +268,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
     func setShortcutRecording(_ recording: Bool) {
+        hover.cancel()
         if recording { preferences.shortcutMessage = "" }
         let status = shortcut.setSuspended(recording)
+        let screenshotStatus = screenshotShortcut.setSuspended(recording)
         if status != noErr { preferences.shortcutMessage = "原快捷键暂时无法恢复（\(status)），请重新录制。" }
+        if screenshotStatus != noErr { preferences.screenshotShortcutMessage = "截图快捷键暂时无法恢复（\(screenshotStatus)），请重新录制。" }
+    }
+    @discardableResult func applyScreenshotShortcut(_ binding: ShortcutBinding) -> Bool {
+        guard !binding.sameChord(as: preferences.shortcutBinding) else {
+            preferences.screenshotShortcutMessage = "该组合已用于翻译已复制文字，原截图快捷键未更改。"; return false
+        }
+        let status = screenshotShortcut.register(binding)
+        guard status == noErr else {
+            preferences.screenshotShortcutMessage = "\(binding.display) 被系统保留、已被占用或无法注册（\(status)）。可重新录制，或从菜单栏截图翻译。"; return false
+        }
+        preferences.screenshotShortcutBinding = binding
+        preferences.shortcutStore.saveScreenshot(binding)
+        preferences.screenshotShortcutMessage = ""; return true
+    }
+    @objc func translateScreenshot() { beginScreenshot(binding: nil) }
+    private func manageScreenCapturePermission() {
+        if !screenCaptureAccess(), !UserDefaults.standard.bool(forKey: "screenCapturePermissionRequested") {
+            UserDefaults.standard.set(true, forKey: "screenCapturePermissionRequested")
+            _ = CGRequestScreenCaptureAccess()
+        }
+        preferences.screenCaptureGranted = screenCaptureAccess()
+        if let window = settingsWindow { settingsReturn.begin(window: window) }
+        if !NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!) { settingsReturn.cancel() }
+    }
+    private func beginScreenshot(binding: ShortcutBinding?) {
+        guard !screenshotCapturing else { return }
+        guard screenCaptureAccess() else {
+            let firstRequest = !UserDefaults.standard.bool(forKey: "screenCapturePermissionRequested")
+            if firstRequest {
+                UserDefaults.standard.set(true, forKey: "screenCapturePermissionRequested")
+                _ = CGRequestScreenCaptureAccess()
+            }
+            preferences.screenCaptureGranted = screenCaptureAccess()
+            let alert = NSAlert(); alert.messageText = "截图翻译需要屏幕录制权限"
+            alert.informativeText = "请在系统设置 → 隐私与安全性 → 屏幕录制中允许轻译。授权后再次触发截图翻译；如系统要求，请退出并重新打开轻译。"
+            alert.addButton(withTitle: "打开系统设置"); alert.addButton(withTitle: "稍后")
+            if alert.runModal() == .alertFirstButtonReturn { manageScreenCapturePermission() }
+            return
+        }
+        cancelScreenshot(restore: false)
+        let id = UUID(); screenshotID = id; screenshotCapturing = true
+        hover.cancel(); hoverTicket?.cancel(); hoverTicket = nil
+        monitor.setScreenshotSuspended(true)
+        screenshotWasVisible = floating.concealForScreenshot()
+        screenshotTask = Task { [weak self] in
+            guard let self = self else { return }
+            do {
+                try await ScreenshotHotkeyRelease.wait(binding: binding)
+                // Let the menu close and the hidden windows leave the compositor.
+                try await Task.sleep(nanoseconds: 100_000_000)
+                guard self.screenshotID == id else { return }
+                let image = try await self.screenshotCapture.capture()
+                guard self.screenshotID == id, !Task.isCancelled else { return }
+                guard let image = image else { self.cancelScreenshot(restore: true); return }
+                self.screenshotCapturing = false
+                self.monitor.setScreenshotSuspended(false)
+                self.fingerprint = ""; self.selection = nil; self.triggered = true
+                // Keep the concealed result and retry session until OCR tells us
+                // whether this screenshot actually needs translation.
+                self.recognizeScreenshot(image, keepPosition: false)
+            } catch is CancellationError {
+                if self.screenshotID == id { self.cancelScreenshot(restore: true) }
+            } catch {
+                guard self.screenshotID == id else { return }
+                self.cancelScreenshot(restore: true)
+                let alert = NSAlert(); alert.messageText = "截图未完成"; alert.informativeText = error.localizedDescription
+                alert.runModal()
+            }
+        }
+    }
+    private func recognizeScreenshot(_ image: CGImage, keepPosition: Bool) {
+        screenshotTask?.cancel()
+        let id = UUID(); screenshotID = id; screenshotImage = image
+        // First-pass OCR stays silent, so Chinese never creates a new window.
+        // A retry can update the existing error window while recognizing again.
+        if keepPosition { showScreenshotRecognition(id: id, keepPosition: true) }
+        screenshotTask = Task { [weak self] in
+            guard let self = self else { return }
+            do {
+                let text = try await self.screenshotOCR.recognize(image)
+                try Task.checkCancellation()
+                guard self.screenshotID == id else { return }
+                let cleaned = TextPolicy.clean(text)
+                if !cleaned.isEmpty, !TextPolicy.needsTranslation(cleaned) {
+                    self.screenshotTask = nil
+                    if self.screenshotWasVisible { self.cancelScreenshot(restore: true) }
+                    else { self.dismiss() }
+                    return
+                }
+                // Empty/OCR/length errors remain actionable; Chinese is skipped
+                // before model selection, session creation or window display.
+                let source = try ScreenshotText.validate(cleaned)
+                self.screenshotTask = nil; self.screenshotWasVisible = false
+                if !keepPosition { self.floating.hide() }
+                self.startTranslation(source, keepPosition: true)
+            } catch is CancellationError { }
+            catch {
+                guard self.screenshotID == id, !Task.isCancelled else { return }
+                self.screenshotTask = nil; self.screenshotWasVisible = false
+                self.translationSession = nil; self.translation?.cancel(); self.translation = nil
+                self.modelLoadingTask?.cancel(); self.modelLoadingTask = nil
+                self.hoverSessionActive = false; self.hoverContext = nil
+                if !keepPosition { self.floating.hide() }
+                self.showScreenshotRecognition(id: id, keepPosition: keepPosition)
+                self.floating.state.loading = false; self.floating.state.error = true
+                self.floating.state.complete = false; self.floating.state.status = "截图文字识别未完成"
+                self.floating.state.text = error.localizedDescription
+            }
+        }
+    }
+    private func showScreenshotRecognition(id: UUID, keepPosition: Bool) {
+        floating.showResult(source: "截图翻译", keepPosition: keepPosition, position: preferences.translationWindowPosition)
+        floating.state.sessionID = id; floating.state.status = "正在识别截图"
+        floating.state.modelSelectionEnabled = false; floating.state.choice = nil; floating.state.defaultChoice = nil
+        floating.state.temporaryModel = false; floating.state.loadingChatGPTModels = false
+    }
+    private func cancelScreenshot(restore: Bool) {
+        screenshotID = nil; screenshotTask?.cancel(); screenshotTask = nil
+        screenshotCapture.cancel(); screenshotImage = nil
+        let visible = screenshotWasVisible
+        screenshotWasVisible = false; screenshotCapturing = false
+        if monitor.screenshotSuspended { monitor.setScreenshotSuspended(false) }
+        if restore { floating.restoreAfterScreenshot(wasVisible: visible) }
     }
     private func selectionChanged(_ snapshot: SelectionSnapshot?) {
-        guard !preferences.paused, !monitor.modelMenuTracking else { return }
+        guard screenshotID == nil, !preferences.paused, !monitor.modelMenuTracking else { return }
         guard let snapshot = snapshot else {
             fingerprint = ""; selection = nil
             if floating.state.pinned { floating.hideButton() } else { dismiss() }
@@ -252,7 +424,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let source = NSPasteboard.general.string(forType: .string) ?? ""
         startTranslation(source)
     }
-    private func startTranslation(_ source: String, keepPosition: Bool = false) {
+    private func retryTranslation() {
+        if let image = screenshotImage, translationSession == nil, !screenshotCapturing {
+            recognizeScreenshot(image, keepPosition: true); return
+        }
+        if translationSession != nil { performTranslation(keepPosition: true) }
+        else if let context = hoverContext, hoverSessionActive,
+                NSWorkspace.shared.frontmostApplication?.processIdentifier == context.pid {
+            translateHoveredParagraph(at: context.point)
+        }
+    }
+    private func translateHoveredParagraph(at point: CGPoint) {
+        guard screenshotID == nil, preferences.hoverEnabled, preferences.trusted, !monitor.modelMenuTracking,
+              let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid(),
+              !preferences.excluded.contains(app.bundleIdentifier ?? "") else { return }
+        let pid = app.processIdentifier
+        HoverDiagnostics.log("read started pid=\(pid)")
+        hoverTicket?.cancel()
+        let ticket = HoverReadTicket(); hoverTicket = ticket
+        monitor.suppressAutomaticSelectionForHover()
+        fingerprint = ""; selection = nil; triggered = true
+        // Keep the existing session until the new paragraph needs translation.
+        // A Chinese hover must not invalidate a pinned result or its retry.
+        floating.hideButton()
+        hoverReadQueue.async { [weak self] in
+            let result = Result { try HoverParagraphReader.read(pid: pid, point: point, ticket: ticket) }
+            DispatchQueue.main.async {
+                guard let self = self, ticket.isCurrent, self.preferences.hoverEnabled,
+                      self.preferences.trusted, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+                      !self.preferences.excluded.contains(app.bundleIdentifier ?? "") else { return }
+                self.hoverTicket = nil
+                switch result {
+                case .success(let paragraph):
+                    HoverDiagnostics.log("read completed characters=\(paragraph.text.count)")
+                    self.acceptHoveredParagraph(paragraph.text, context: (pid, point))
+                case .failure(let error):
+                    HoverDiagnostics.log("read failed: \(error.localizedDescription)")
+                    if error is CancellationError { return }
+                    self.translationSession = nil; self.translation?.cancel()
+                    self.modelLoadingTask?.cancel(); self.modelLoadingTask = nil
+                    self.hoverContext = (pid, point); self.hoverSessionActive = true
+                    self.floating.showResult(source: "悬停翻译", position: self.preferences.translationWindowPosition)
+                    self.floating.state.text = error.localizedDescription
+                    self.floating.state.loading = false; self.floating.state.error = true
+                    self.floating.state.sessionID = UUID(); self.floating.state.choice = nil
+                    self.floating.state.defaultChoice = nil; self.floating.state.temporaryModel = false
+                    self.floating.state.modelSelectionEnabled = false; self.floating.state.status = "无法读取段落"
+                }
+            }
+        }
+    }
+    private func acceptHoveredParagraph(_ source: String, context: (pid: pid_t, point: CGPoint)? = nil) {
+        guard TextPolicy.needsTranslation(source) else {
+            HoverDiagnostics.log("read skipped: no translation needed")
+            return
+        }
+        hoverContext = context
+        startTranslation(source, fromHover: true)
+    }
+    private func startTranslation(_ source: String, keepPosition: Bool = false, fromHover: Bool = false) {
+        cancelScreenshot(restore: false)
+        hoverTicket?.cancel(); hoverTicket = nil; hoverSessionActive = fromHover
+        if !fromHover { hoverContext = nil }
         translation?.cancel(); modelLoadingTask?.cancel(); modelLoadingTask = nil
         let initial = try? engine.defaultChoice()
         translationSession = TranslationSession(source: source, defaultChoice: initial)
@@ -318,6 +551,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return error.localizedDescription
     }
     private func dismiss() {
+        cancelScreenshot(restore: false)
+        hoverTicket?.cancel(); hoverTicket = nil; hoverSessionActive = false; hoverContext = nil
         translationSession = nil; translation?.cancel(); translation = nil
         modelLoadingTask?.cancel(); modelLoadingTask = nil; floating.hide()
     }
@@ -330,6 +565,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startTranslation("Small steps make complex things easier to understand.")
         floating.resultPanel.makeKeyAndOrderFront(nil)
     }
+    #if QINGYI_TESTING
+    func prepareScreenshotFixture(engine: TranslationEngine, capture: ScreenshotCapturing, ocr: ScreenshotRecognizing) {
+        self.engine = engine; screenshotCapture = capture; screenshotOCR = ocr; screenCaptureAccess = { true }
+        floating.onRetry = { [weak self] in self?.retryTranslation() }
+        floating.onClose = { [weak self] in self?.dismiss() }
+    }
+    func screenshotClipboardFixture(_ text: String) { startTranslation(text) }
+    var screenshotActiveFixture: Bool { screenshotID != nil }
+    func prepareHoverFixture(engine: TranslationEngine) {
+        self.engine = engine
+        floating.onRetry = { [weak self] in self?.retryTranslation() }
+        monitor.onSelection = { [weak self] in self?.selectionChanged($0) }
+    }
+    func feedHoverFixture(_ source: String) {
+        monitor.suppressAutomaticSelectionForHover()
+        acceptHoveredParagraph(source)
+    }
+    func dismissHoverFixture() { dismiss() }
+    #endif
 }
 
 if CommandLine.arguments.contains("--credential-check") {
@@ -375,7 +629,13 @@ if CommandLine.arguments.contains("--services-translation-check") {
             defaults.setPersistentDomain(snapshot, forName: domain)
             let api = APIConfigurationStore(defaults: defaults)
             let accounts = ChatGPT(defaults: defaults).registrations
-            let sample = "Small steps make complex things easier to understand."
+            let sample: String
+            if let index = CommandLine.arguments.firstIndex(of: "--screenshot-input"), CommandLine.arguments.count > index + 1 {
+                let path = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+                guard let source = CGImageSourceCreateWithURL(path as CFURL, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw QingyiError.message("无法读取指定的 OCR 验证图片。") }
+                sample = try ScreenshotText.validate(await VisionScreenshotOCR().recognize(image))
+                print("PASS local screenshot OCR: \(sample.count) characters; only text will be sent")
+            } else { sample = "Small steps make complex things easier to understand." }
             var passed = 0, failed = 0
             func verify(_ engine: TranslationEngine, target: TranslationTarget, label: String) async {
                 do {
@@ -415,7 +675,8 @@ if CommandLine.arguments.contains("--services-translation-check") {
             exit(failed == 0 ? 0 : 1)
         } catch { fputs("FAIL \(error.localizedDescription)\n", stderr); exit(1) }
     }
-    dispatchMain()
+    NSApplication.shared.setActivationPolicy(.accessory)
+    NSApplication.shared.run()
 }
 
 if CommandLine.arguments.contains("--default-translation-check") {

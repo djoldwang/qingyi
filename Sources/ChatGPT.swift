@@ -55,6 +55,7 @@ final class ChatGPT: ObservableObject {
     private var modelTask: Task<Void, Never>?
     private var modelRequestID: UUID?
     private var generation = UUID()
+    private var settingsRestoreTask: Task<Void, Never>?
     private var loadedCredentials = false
     private var credentials: Credentials?
     private let issuer = "https://auth.openai.com"
@@ -77,6 +78,25 @@ final class ChatGPT: ObservableObject {
         if let value = defaults.string(forKey: "hostID") { return value }
         let value = "urn:uuid:" + UUID().uuidString.lowercased()
         defaults.set(value, forKey: "hostID"); return value
+    }
+    // Opening settings must never wait for SecurityAgent on the UI thread.
+    // Reuse the existing coalesced, time-limited request credential path.
+    func restoreForSettings() {
+        guard !loadedCredentials, settingsRestoreTask == nil else { return }
+        let client = activeID; let run = generation
+        message = "正在读取 ChatGPT 登录信息…"
+        settingsRestoreTask = Task { [weak self] in
+            guard let self = self else { return }
+            defer { if activeID == client, generation == run { settingsRestoreTask = nil } }
+            do {
+                try await restoreForRequest()
+                try Task.checkCancellation()
+                guard activeID == client, generation == run else { return }
+                message = signedIn ? "已连接 \(activeAccount?.email ?? "ChatGPT")。使用量计入账号获准的订阅额度。" : "请重新登录，并允许使用 ChatGPT 订阅额度。"
+                if signedIn, models.isEmpty { await refreshModels() }
+            } catch is CancellationError { }
+            catch { if activeID == client, generation == run { message = error.localizedDescription } }
+        }
     }
     func restore() {
         cleanObsoleteCredentials()
@@ -179,6 +199,7 @@ final class ChatGPT: ObservableObject {
     }
     func cancelLogin() {
         guard !signingOut else { return }
+        settingsRestoreTask?.cancel(); settingsRestoreTask = nil
         generation = UUID(); authTask?.cancel(); receiver?.cancel(); receiver = nil; authTask = nil; busy = false
         refreshTask?.cancel(); refreshTask = nil; credentialRead = nil
         resetModelLoading()

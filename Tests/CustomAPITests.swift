@@ -73,6 +73,8 @@ extension QingyiTests {
             try data.write(to: url.appendingPathComponent(name))
             window.close()
         }
+        let screenshot = QingyiTests.screenshotImage()
+        try NSBitmapImageRep(cgImage: screenshot).representation(using: .png, properties: [:])!.write(to: url.appendingPathComponent("ocr-english-sample.png"))
         try render(APIProviderEditor(api: store, provider: store.activeProvider!), name: "api-editor.png", size: NSSize(width: 650, height: 730))
         try render(APIProviderEditor(api: store, provider: store.activeProvider!), name: "api-editor-dark.png", size: NSSize(width: 650, height: 730), dark: true)
         try render(SettingsView(preferences: Preferences(defaults: defaults), chat: ChatGPT(defaults: defaults), api: store, navigation: SettingsNavigation(section: .services), updateShortcut: { _ in true }, shortcutRecording: { _ in }, preview: {}, verify: {}, loadsAccounts: false), name: "settings-custom-api.png", size: NSSize(width: 900, height: 680))
