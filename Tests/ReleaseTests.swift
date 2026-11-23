@@ -5,8 +5,12 @@ final class AccountTestVault: ChatGPTCredentialVault {
     var values: [String: Credentials] = [:]
     var removed: [String] = []
     var failRemove = false
+    var failSave = false
     func read(_ id: String) throws -> Credentials? { values[id] }
-    func save(_ credentials: Credentials, id: String) throws { values[id] = credentials }
+    func save(_ credentials: Credentials, id: String) throws {
+        if failSave { throw QingyiError.message("fixture save failure") }
+        values[id] = credentials
+    }
     func remove(_ id: String) throws {
         if failRemove { throw QingyiError.message("fixture deletion failure") }
         removed.append(id); values.removeValue(forKey: id)
@@ -14,6 +18,9 @@ final class AccountTestVault: ChatGPTCredentialVault {
 }
 
 extension QingyiTests {
+    static func fixtureCredentials(_ access: String) -> Credentials {
+        Credentials(access: access, refresh: nil, idToken: "", scopes: ["chatgpt.tokens.use.direct"], expiry: Date().addingTimeInterval(3600))
+    }
     @MainActor static func releaseTests() async {
         check("Automatic symbol and single-letter filters preserve manual input and meaningful text") {
             let filtered = ["a", "I", "é", "e\u{301}", "\n A \t", "/", "\\", "---", "_", "...", " / - ", "()[]{}", "∑≈∞", "😀", "👨‍👩‍👧‍👦", "\n! \t"]
@@ -105,22 +112,116 @@ extension QingyiTests {
             try expect(Preferences(defaults: defaults).excluded.isEmpty)
             try expect(defaults.object(forKey: "excludedAppLocations") == nil)
         }
-        check("Saved same-email accounts merge case-insensitively and retain the active account and model") {
-            let name = "qingyi-account-merge-" + UUID().uuidString
+        check("Same-email registrations survive startup and obsolete cleanup queues never delete keys") {
+            let name = "qingyi-registration-startup-" + UUID().uuidString
             let defaults = UserDefaults(suiteName: name)!
             defer { defaults.removePersistentDomain(forName: name) }
-            let accounts = [Registration(id: "active", subject: "a", email: " User@Example.com "), Registration(id: "duplicate", subject: "b", email: "user@example.com"), Registration(id: "other", subject: "c", email: "other@example.com")]
+            let accounts = [Registration(id: "active", subject: "a", email: " User@Example.com "), Registration(id: "second", subject: "b", email: "user@example.com")]
             defaults.set(try JSONEncoder().encode(accounts), forKey: "registrations")
             defaults.set("active", forKey: "activeRegistration")
             defaults.set("keep-model", forKey: "model.active")
-            defaults.set("old-model", forKey: "model.duplicate")
+            defaults.set("other-model", forKey: "model.second")
+            defaults.set("orphan-model", forKey: "model.orphan")
+            defaults.set(["second", "orphan"], forKey: "obsoleteChatGPTCredentials")
+            let vault = AccountTestVault()
+            for id in ["active", "second", "orphan"] { vault.values[id] = fixtureCredentials(id) }
+            let chat = ChatGPT(defaults: defaults, session: FixtureAPIProtocol.session(), vault: vault)
+            chat.restore()
+            try expect(chat.registrations == accounts && chat.modelID == "keep-model")
+            try expect(vault.removed.isEmpty && Set(vault.values.keys) == Set(["active", "second", "orphan"]))
+            try expect(defaults.object(forKey: "obsoleteChatGPTCredentials") == nil)
+            try expect(defaults.string(forKey: "model.second") == "other-model" && defaults.string(forKey: "model.orphan") == "orphan-model")
+            try expect(chat.accountLabel(accounts[0]) != chat.accountLabel(accounts[1]))
+            let reloaded = ChatGPT(defaults: defaults, session: FixtureAPIProtocol.session(), vault: vault)
+            try expect(reloaded.registrations == accounts && reloaded.accountLabel(accounts[1]) == chat.accountLabel(accounts[1]))
+        }
+        check("A new same-email registration keeps both token sets and does not inherit the old model") {
+            let name = "qingyi-registration-add-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: name)!
+            defer { defaults.removePersistentDomain(forName: name) }
             let vault = AccountTestVault()
             let chat = ChatGPT(defaults: defaults, session: FixtureAPIProtocol.session(), vault: vault)
-            try expect(chat.registrations.map(\.id) == ["active", "other"] && chat.modelID == "keep-model")
-            try expect(vault.removed.isEmpty, "Initialization must defer credential cleanup")
-            chat.restore()
-            try expect(vault.removed == ["duplicate"] && defaults.object(forKey: "model.duplicate") == nil)
-            try expect(chat.activeID == "active" && chat.modelID == "keep-model")
+            let host = chat.hostID
+            try chat.saveVerifiedRegistration(client: "personal", identity: VerifiedIdentity(subject: "user", email: "same@example.com"), saved: fixtureCredentials("personal-token"), replacing: nil)
+            chat.modelID = "personal-model"
+            let first = chat.activeAccount!
+            try chat.saveVerifiedRegistration(client: "workspace", identity: VerifiedIdentity(subject: "user", email: "SAME@example.com"), saved: fixtureCredentials("workspace-token"), replacing: nil)
+            try expect(chat.registrations.map(\.id) == ["personal", "workspace"])
+            try expect(vault.values["personal"]?.access == "personal-token" && vault.values["workspace"]?.access == "workspace-token" && vault.removed.isEmpty)
+            try expect(chat.activeID == "workspace" && chat.modelID.isEmpty && defaults.string(forKey: "model.personal") == "personal-model")
+            try expect(chat.hostID == host && chat.accountLabel(first) != chat.activeAccountLabel)
+        }
+        check("Reauthorization updates only the issued client and preserves its model and list position") {
+            let name = "qingyi-registration-reauth-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: name)!
+            defer { defaults.removePersistentDomain(forName: name) }
+            let vault = AccountTestVault()
+            let chat = ChatGPT(defaults: defaults, session: FixtureAPIProtocol.session(), vault: vault)
+            try chat.saveVerifiedRegistration(client: "a", identity: VerifiedIdentity(subject: "subject-a", email: "same@example.com"), saved: fixtureCredentials("a-old"), replacing: nil)
+            chat.modelID = "model-a"
+            let original = chat.activeAccount!
+            try chat.saveVerifiedRegistration(client: "b", identity: VerifiedIdentity(subject: "subject-b", email: "same@example.com"), saved: fixtureCredentials("b"), replacing: nil)
+            defaults.set("a", forKey: "pendingClient")
+            try chat.saveVerifiedRegistration(client: "a", identity: VerifiedIdentity(subject: "subject-a", email: "renamed@example.com"), saved: fixtureCredentials("a-new"), replacing: original)
+            try expect(chat.registrations.map(\.id) == ["a", "b"] && chat.registrations[0].email == "renamed@example.com")
+            try expect(chat.activeID == "a" && chat.modelID == "model-a")
+            try expect(vault.values["a"]?.access == "a-new" && vault.values["b"]?.access == "b" && vault.removed.isEmpty)
+            try expect(defaults.object(forKey: "pendingClient") == nil)
+        }
+        check("Same email never permits a changed subject or client to overwrite a saved registration") {
+            let name = "qingyi-registration-reject-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: name)!
+            defer { defaults.removePersistentDomain(forName: name) }
+            let vault = AccountTestVault()
+            let chat = ChatGPT(defaults: defaults, session: FixtureAPIProtocol.session(), vault: vault)
+            let identity = VerifiedIdentity(subject: "original", email: "same@example.com")
+            try chat.saveVerifiedRegistration(client: "a", identity: identity, saved: fixtureCredentials("original"), replacing: nil)
+            let original = chat.activeAccount!
+            try rejects { try chat.saveVerifiedRegistration(client: "a", identity: VerifiedIdentity(subject: "impostor", email: identity.email), saved: fixtureCredentials("wrong"), replacing: original) }
+            try rejects { try chat.saveVerifiedRegistration(client: "a", identity: VerifiedIdentity(subject: "impostor", email: identity.email), saved: fixtureCredentials("wrong"), replacing: nil) }
+            try rejects { try chat.saveVerifiedRegistration(client: "other", identity: identity, saved: fixtureCredentials("wrong"), replacing: original) }
+            var denied = fixtureCredentials("denied"); denied.scopes = ["openid"]
+            try rejects { try chat.saveVerifiedRegistration(client: "a", identity: identity, saved: denied, replacing: original) }
+            try expect(chat.registrations == [original] && chat.activeID == "a" && vault.values["a"]?.access == "original" && vault.values.count == 1)
+        }
+        check("A failed credential save preserves registrations active account model and pending registration") {
+            let name = "qingyi-registration-save-failure-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: name)!
+            defer { defaults.removePersistentDomain(forName: name) }
+            let vault = AccountTestVault()
+            let chat = ChatGPT(defaults: defaults, session: FixtureAPIProtocol.session(), vault: vault)
+            try chat.saveVerifiedRegistration(client: "a", identity: VerifiedIdentity(subject: "a", email: "same@example.com"), saved: fixtureCredentials("a"), replacing: nil)
+            chat.modelID = "model-a"; defaults.set("b", forKey: "pendingClient")
+            let before = chat.registrations
+            vault.failSave = true
+            try rejects { try chat.saveVerifiedRegistration(client: "b", identity: VerifiedIdentity(subject: "b", email: "same@example.com"), saved: fixtureCredentials("b"), replacing: nil) }
+            try expect(chat.registrations == before && chat.activeID == "a" && chat.modelID == "model-a" && chat.signedIn)
+            try expect(defaults.string(forKey: "pendingClient") == "b" && vault.values.count == 1 && vault.removed.isEmpty)
+        }
+        await asyncCheck("Same-email account switching refresh and explicit deletion stay scoped to the client") {
+            let name = "qingyi-registration-routing-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: name)!
+            let session = FixtureAPIProtocol.session()
+            defer { defaults.removePersistentDomain(forName: name); session.invalidateAndCancel(); FixtureAPIProtocol.handle = nil }
+            FixtureAPIProtocol.handle = { _ in (200, "application/json", Data(#"{"models":[]}"#.utf8)) }
+            let vault = AccountTestVault()
+            let chat = ChatGPT(defaults: defaults, session: session, vault: vault)
+            defer { chat.cancelLogin() }
+            for id in ["a", "b"] {
+                try chat.saveVerifiedRegistration(client: id, identity: VerifiedIdentity(subject: "same-user", email: "same@example.com"), saved: fixtureCredentials(id), replacing: nil)
+                chat.modelID = "model-" + id
+            }
+            chat.selectAccount("a")
+            let tokenA = try await chat.accessToken()
+            try expect(tokenA == "a")
+            try expect(chat.modelID == "model-a")
+            chat.selectAccount("b")
+            let tokenB = try await chat.accessToken()
+            try expect(tokenB == "b")
+            try expect(chat.modelID == "model-b")
+            chat.removeAccount("a")
+            try expect(chat.registrations.map(\.id) == ["b"] && vault.values["b"]?.access == "b" && vault.removed == ["a"])
+            try expect(defaults.string(forKey: "model.b") == "model-b")
         }
         check("Account deletion failure preserves records; deleting the active account chooses a remaining account") {
             let name = "qingyi-account-delete-" + UUID().uuidString

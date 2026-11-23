@@ -66,10 +66,18 @@ final class ChatGPT: ObservableObject {
         if let data = defaults.data(forKey: "registrations"), let values = try? JSONDecoder().decode([Registration].self, from: data) { registrations = values }
         activeID = defaults.string(forKey: "activeRegistration") ?? ""
         modelID = defaults.string(forKey: "model.\(activeID)") ?? ""
-        mergeSavedAccounts()
+        // Older builds queued other registrations for deletion by email. Those
+        // entries may belong to another workspace: cancel the queue, never the keys.
+        defaults.removeObject(forKey: "obsoleteChatGPTCredentials")
         // Keychain access is deferred until the user opens settings or requests translation.
     }
     var activeAccount: Registration? { registrations.first { $0.id == activeID } }
+    var activeAccountLabel: String { activeAccount.map { accountLabel($0) } ?? "ChatGPT" }
+    func accountLabel(_ account: Registration) -> String {
+        let matches = registrations.filter { Self.emailKey($0.email) == Self.emailKey(account.email) }
+        guard matches.count > 1, let index = matches.firstIndex(where: { $0.id == account.id }) else { return account.email }
+        return "\(account.email) · 连接 \(index + 1)"
+    }
     var modelName: String { models.first(where: { $0.id == modelID })?.name ?? modelID }
     var temporaryModelChoices: [ModelChoice] {
         temporaryModelsAccountID == activeID ? temporaryModels : models
@@ -93,21 +101,20 @@ final class ChatGPT: ObservableObject {
                 try await restoreForRequest()
                 try Task.checkCancellation()
                 guard activeID == client, generation == run else { return }
-                message = signedIn ? "已连接 \(activeAccount?.email ?? "ChatGPT")。使用量计入账号获准的订阅额度。" : "请重新登录，并允许使用 ChatGPT 订阅额度。"
+                message = signedIn ? "已连接 \(activeAccountLabel)。使用量计入账号获准的订阅额度。" : "请重新登录，并允许使用 ChatGPT 订阅额度。"
                 if signedIn, models.isEmpty { await refreshModels() }
             } catch is CancellationError { }
             catch { if activeID == client, generation == run { message = error.localizedDescription } }
         }
     }
     func restore() {
-        cleanObsoleteCredentials()
         guard !loadedCredentials else { return }
         loadedCredentials = true
         guard !activeID.isEmpty else { return }
         do {
             credentials = try vault.read(activeID)
             signedIn = credentials?.scopes.contains("chatgpt.tokens.use.direct") == true
-            message = signedIn ? "已连接 \(activeAccount?.email ?? "ChatGPT")。使用量计入账号获准的订阅额度。" : "请重新登录，并允许使用 ChatGPT 订阅额度。"
+            message = signedIn ? "已连接 \(activeAccountLabel)。使用量计入账号获准的订阅额度。" : "请重新登录，并允许使用 ChatGPT 订阅额度。"
         } catch { message = error.localizedDescription }
     }
     func selectAccount(_ id: String) {
@@ -165,33 +172,10 @@ final class ChatGPT: ObservableObject {
                 let (jwks, response) = try await session.data(from: URL(string: issuer + "/.well-known/jwks.json")!)
                 try HTTP.check(response, data: jwks)
                 let identity = try IdentityValidator.verify(idToken, clientID: client, nonce: nonce, jwks: jwks)
-                if let registration = registration, !registration.subject.isEmpty,
-                   registration.subject != identity.subject,
-                   Self.emailKey(registration.email) == nil || Self.emailKey(registration.email) != Self.emailKey(identity.email) {
-                    throw QingyiError.message("返回的账号与原账号不同。请使用“添加账号”重新授权。")
-                }
                 let saved = try Self.decodeCredentials(tokens)
-                guard saved.scopes.contains("chatgpt.tokens.use.direct") else { throw QingyiError.message("已验证登录身份，但未获准使用订阅额度。请重新登录并开启授权。") }
                 try Task.checkCancellation()
                 guard self.generation == run else { return }
-                try vault.save(saved, id: client)
-                let account = Registration(id: client, subject: identity.subject, email: identity.email)
-                let duplicates = registrations.filter { existing in
-                    existing.id == client || (Self.emailKey(account.email) != nil && Self.emailKey(existing.email) == Self.emailKey(account.email))
-                }
-                let preferred = duplicates.first(where: { $0.id == activeID }) ?? duplicates.last
-                let preferredModel = preferred.flatMap { defaults.string(forKey: "model.\($0.id)") } ?? ""
-                registrations.removeAll { existing in duplicates.contains(where: { $0.id == existing.id }) }
-                registrations.append(account)
-                persistRegistrations()
-                resetModelLoading(); models = []; temporaryModels = []; temporaryModelsAccountID = ""
-                activeID = client; defaults.set(client, forKey: "activeRegistration")
-                credentials = saved; loadedCredentials = true; signedIn = saved.scopes.contains("chatgpt.tokens.use.direct")
-                modelID = preferredModel
-                queueCredentialCleanup(duplicates.filter { $0.id != client }.map(\.id))
-                cleanObsoleteCredentials()
-                defaults.removeObject(forKey: "pendingClient")
-                guard signedIn else { throw QingyiError.message("已验证登录身份，但未获准使用订阅额度。请重新登录并开启授权。") }
+                try saveVerifiedRegistration(client: client, identity: identity, saved: saved, replacing: registration)
                 message = "已连接 \(identity.email)，正在读取可用模型…"
                 await refreshModels()
             } catch is CancellationError { }
@@ -345,7 +329,7 @@ final class ChatGPT: ObservableObject {
             guard !choices.isEmpty else { modelLoadState = .empty; return }
             if !choices.contains(where: { $0.id == modelID }) { modelID = choices[0].id }
             modelLoadState = .loaded
-            message = "已连接 \(activeAccount?.email ?? "ChatGPT") · 可选择 \(choices.count) 个模型。首次翻译成功后即可确认模型访问权限。"
+            message = "已连接 \(activeAccountLabel) · 可选择 \(choices.count) 个模型。首次翻译成功后即可确认模型访问权限。"
         } catch is CancellationError {
             if modelRequestID == requestID { modelLoadState = .idle }
         } catch {
@@ -459,36 +443,33 @@ final class ChatGPT: ObservableObject {
         let value = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return value.contains("@") ? value : nil
     }
-    private func mergeSavedAccounts() {
-        var keepers: [String: Registration] = [:]
-        for account in registrations {
-            guard let key = Self.emailKey(account.email) else { continue }
-            if keepers[key]?.id != activeID { keepers[key] = account }
+    // Called only after signature, audience, nonce and callback validation.
+    // A verified email is display metadata, never a registration identity.
+    func saveVerifiedRegistration(client: String, identity: VerifiedIdentity, saved: Credentials, replacing registration: Registration?) throws {
+        guard !client.isEmpty, client != "dynamic_agent_client",
+              registration == nil || registration?.id == client else {
+            throw QingyiError.message("返回的授权连接与原连接不同，请重新授权。")
         }
-        let obsolete = registrations.filter { account in
-            guard let key = Self.emailKey(account.email) else { return false }
-            return keepers[key]?.id != account.id
+        for previous in [registration, registrations.first(where: { $0.id == client })].compactMap({ $0 }) {
+            guard previous.subject.isEmpty || previous.subject == identity.subject else {
+                throw QingyiError.message("返回的账号与原账号不同。请使用“添加账号”重新授权。")
+            }
         }
-        guard !obsolete.isEmpty else { return }
-        queueCredentialCleanup(obsolete.map(\.id))
-        registrations.removeAll { account in obsolete.contains(where: { $0.id == account.id }) }
+        guard saved.scopes.contains("chatgpt.tokens.use.direct") else {
+            throw QingyiError.message("已验证登录身份，但未获准使用订阅额度。请重新登录并开启授权。")
+        }
+        // Persist credentials before changing the visible selection. A failed
+        // keychain write leaves all registrations, models and active state intact.
+        try vault.save(saved, id: client)
+        let account = Registration(id: client, subject: identity.subject, email: identity.email)
+        if let index = registrations.firstIndex(where: { $0.id == client }) { registrations[index] = account }
+        else { registrations.append(account) }
         persistRegistrations()
-    }
-    private func queueCredentialCleanup(_ ids: [String]) {
-        let pending = Set(defaults.stringArray(forKey: "obsoleteChatGPTCredentials") ?? []).union(ids)
-        defaults.set(Array(pending).sorted(), forKey: "obsoleteChatGPTCredentials")
-    }
-    private func cleanObsoleteCredentials() {
-        var remaining: [String] = []
-        for id in defaults.stringArray(forKey: "obsoleteChatGPTCredentials") ?? [] {
-            guard id != activeID, !registrations.contains(where: { $0.id == id }) else { continue }
-            do {
-                try vault.remove(id); defaults.removeObject(forKey: "model.\(id)")
-                if defaults.string(forKey: "pendingClient") == id { defaults.removeObject(forKey: "pendingClient") }
-            } catch { remaining.append(id) }
-        }
-        defaults.set(remaining, forKey: "obsoleteChatGPTCredentials")
-        accountError = remaining.isEmpty ? "" : "重复账号已合并，部分旧登录凭据未能清理；下次打开账号设置时将重试。"
+        resetModelLoading(); models = []; temporaryModels = []; temporaryModelsAccountID = ""; credentialRead = nil
+        activeID = client; defaults.set(client, forKey: "activeRegistration")
+        credentials = saved; loadedCredentials = true; signedIn = true
+        modelID = defaults.string(forKey: "model.\(client)") ?? ""
+        if defaults.string(forKey: "pendingClient") == client { defaults.removeObject(forKey: "pendingClient") }
     }
     private func persistRegistrations() { defaults.set(try? JSONEncoder().encode(registrations), forKey: "registrations") }
 }

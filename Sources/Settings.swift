@@ -182,7 +182,7 @@ struct SettingsView: View {
             Button("取消", role: .cancel) { accountToDelete = nil }
             Button("删除账号", role: .destructive) { chat.removeAccount(account.id); accountToDelete = nil }
         } message: { account in
-            Text("将移除 \(account.email) 及其本机登录凭据和模型偏好，再次使用需要重新授权。")
+            Text("将移除 \(chat.accountLabel(account)) 及其本机登录凭据和模型偏好，再次使用需要重新授权。")
         }
         .onChange(of: api.activeProviderID) { _, id in
             if id.isEmpty { restoreAccount() }
@@ -418,8 +418,8 @@ struct SettingsView: View {
             SettingsGroup(title: "当前账号") {
                 SettingsRow {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(chat.activeAccount?.email ?? "尚未连接 ChatGPT").lineLimit(1).truncationMode(.tail)
-                            .help(chat.activeAccount?.email ?? "尚未连接 ChatGPT").textSelection(.enabled)
+                        Text(chat.activeAccount.map { chat.accountLabel($0) } ?? "尚未连接 ChatGPT").lineLimit(1).truncationMode(.tail)
+                            .help(chat.activeAccount.map { chat.accountLabel($0) } ?? "尚未连接 ChatGPT").textSelection(.enabled)
                         hint(chat.message)
                     }
                     Spacer(minLength: 0)
@@ -469,13 +469,13 @@ struct SettingsView: View {
             ForEach(chat.registrations) { account in
                 if account.id != chat.registrations.first?.id { Divider() }
                 SettingsRow {
-                    Text(account.email).lineLimit(1).truncationMode(.tail).help(account.email).textSelection(.enabled)
+                    Text(chat.accountLabel(account)).lineLimit(1).truncationMode(.tail).help(chat.accountLabel(account)).textSelection(.enabled)
                     Spacer()
                     if account.id == chat.activeID {
                         Text("当前账号").font(.system(size: 11, weight: .medium)).foregroundStyle(accent).fixedSize()
                     } else { Button("切换") { chat.selectAccount(account.id) }.disabled(chat.busy).settingsAction() }
                     Button("删除", role: .destructive) { accountToDelete = account }.disabled(chat.busy).settingsAction()
-                        .accessibilityLabel("删除账号 \(account.email)")
+                        .accessibilityLabel("删除账号 \(chat.accountLabel(account))")
                 }
             }
         }
