@@ -16,6 +16,8 @@ API 模型目录直接位于密钥下方，无需切换子页面；模型可就�
 
 ## ChatGPT 账号连接
 
+浏览器收到授权回调后，会显示“授权信息已接收”。请返回轻译查看最终登录结果，随后可以关闭浏览器页面；该提示不代表身份验证已完成。回调页面支持浅色、深色和窄屏显示，全部资源来自本机。
+
 同一邮箱可以有多个独立授权连接，例如个人和工作区连接。轻译分别保留每个连接的凭据和模型选择，同邮箱时显示连接编号；切换或重新授权不会合并其他连接。删除和退出只影响选中的连接。
 
 升级会取消旧版按邮箱生成的待删除队列。此前已经被旧版删除的凭据无法自动恢复，需要重新授权；尚未删除的凭据和模型偏好会保留。
@@ -84,10 +86,11 @@ bash build.sh
 可选验证：
 
 ```bash
-bash test.sh --loopback  # 本机 OAuth 回调及取消流程
+bash test.sh --loopback  # 本机 OAuth 回调、页面响应及取消流程
 bash test.sh --hotkeys   # 真实 Carbon 快捷键注册与冲突
 bash Tools/test-signing.sh ../轻译-macOS.zip
 bash test.sh --ui-snapshots ../work/ui-snapshots  # 仅用测试数据渲染界面
+bash test.sh --callback-page-previews ../work/callback-previews  # 使用实际模板导出三种回调页面
 ```
 
 功能测试使用固定或临时测试数据，不登录 ChatGPT 或调用真实模型；自定义 API 网络路径使用 URLProtocol 模拟分片响应。已签名应用可通过 `--api-credential-check` 验证独立钥匙串的随机诊断记录读写删除，不读取现有密钥。签名升级检查使用维护者的签名私钥，在临时目录生成下一构建，不修改已安装应用。

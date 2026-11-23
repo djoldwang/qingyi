@@ -62,6 +62,138 @@ enum CallbackParser {
     }
 }
 
+// This page acknowledges the callback only. Token exchange and identity
+// verification continue in the app after the browser receives the response.
+enum OAuthCallbackPage: String, CaseIterable {
+    case received, failed, notFound
+
+    var title: String {
+        switch self {
+        case .received: return "授权信息已接收"
+        case .failed: return "授权未完成"
+        case .notFound: return "页面不存在"
+        }
+    }
+    var message: String {
+        switch self {
+        case .received: return "请返回轻译查看登录结果。"
+        case .failed: return "请返回轻译重新尝试。"
+        case .notFound: return "请从轻译重新发起授权。"
+        }
+    }
+    var httpStatus: String {
+        switch self {
+        case .received: return "200 OK"
+        case .failed: return "400 Bad Request"
+        case .notFound: return "404 Not Found"
+        }
+    }
+    var html: String {
+        """
+        <!doctype html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="referrer" content="no-referrer">
+          <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+          <title>\(title) · 轻译</title>
+          <style>
+            :root {
+              color-scheme: light dark;
+              --page: #f6f7fb; --card: #ffffff; --ink: #252735;
+              --body: #666b7b; --muted: #8a8f9e; --line: #eceef5;
+              --accent: #6863d9; --accent-soft: #f0eefc;
+              --warning: #a87527; --warning-soft: #fbf2e2;
+              --neutral: #7b8192; --neutral-soft: #f0f2f6;
+              --shadow: 0 16px 56px rgba(37, 39, 74, .065), 0 2px 8px rgba(37, 39, 74, .025);
+            }
+            * { box-sizing: border-box; }
+            body {
+              margin: 0; min-height: 100vh; min-height: 100svh;
+              display: grid; place-items: center; padding: 32px 20px;
+              background: var(--page); color: var(--ink);
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+              -webkit-font-smoothing: antialiased;
+            }
+            .card {
+              width: 100%; max-width: 440px; padding: 40px;
+              background: var(--card); border: 1px solid var(--line);
+              border-radius: 24px; box-shadow: var(--shadow); text-align: center;
+            }
+            .brand { display: flex; align-items: center; justify-content: center; gap: 12px; }
+            .brand-mark {
+              position: relative; display: grid; place-items: center;
+              width: 44px; height: 44px; border-radius: 12px;
+              background: linear-gradient(150deg, #777bf5, #5256ce);
+              color: white; font-size: 28px; font-weight: 600; line-height: 1;
+              box-shadow: 0 3px 8px rgba(86, 83, 200, .13);
+            }
+            .brand-mark::after {
+              content: ""; position: absolute; top: 7px; right: 7px;
+              width: 3px; height: 3px; border-radius: 50%; background: #c7f1df;
+            }
+            .brand-name { font-size: 22px; font-weight: 600; letter-spacing: .06em; }
+            .status-icon {
+              position: relative; width: 56px; height: 56px; margin: 36px auto 24px;
+              border-radius: 50%; color: var(--accent); background: var(--accent-soft);
+            }
+            .received .status-icon::after {
+              content: ""; position: absolute; left: 21px; top: 17px;
+              width: 12px; height: 20px; border: solid currentColor;
+              border-width: 0 2.5px 2.5px 0; transform: rotate(45deg);
+            }
+            .failed .status-icon { color: var(--warning); background: var(--warning-soft); }
+            .failed .status-icon::before {
+              content: ""; position: absolute; left: 26.5px; top: 16px;
+              width: 3px; height: 16px; border-radius: 2px; background: currentColor;
+            }
+            .failed .status-icon::after {
+              content: ""; position: absolute; left: 26.5px; top: 36px;
+              width: 3px; height: 3px; border-radius: 50%; background: currentColor;
+            }
+            .notFound .status-icon { color: var(--neutral); background: var(--neutral-soft); }
+            .notFound .status-icon::after {
+              content: ""; position: absolute; left: 18px; top: 27px;
+              width: 20px; height: 2px; border-radius: 2px; background: currentColor;
+            }
+            h1 { margin: 0; font-size: 26px; font-weight: 600; line-height: 1.45; letter-spacing: .02em; }
+            .message { margin: 12px 0 0; color: var(--body); font-size: 16px; line-height: 1.8; }
+            .footer { margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--line); }
+            .footer p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.7; }
+            @media (max-width: 480px) {
+              body { padding: 24px 16px; }
+              .card { padding: 24px; border-radius: 20px; }
+            }
+            @media (prefers-color-scheme: dark) {
+              :root {
+                --page: #11131a; --card: #1b1e28; --ink: #eff0f6;
+                --body: #b7bccd; --muted: #9299ad; --line: #2b2f3e;
+                --accent: #b5adff; --accent-soft: #2d2947;
+                --warning: #e3bd78; --warning-soft: #3b3022;
+                --neutral: #b0b7c9; --neutral-soft: #2c303f;
+                --shadow: 0 16px 56px rgba(0, 0, 0, .16), 0 2px 8px rgba(0, 0, 0, .1);
+              }
+            }
+          </style>
+        </head>
+        <body>
+          <main class="card \(rawValue)">
+            <header class="brand" aria-label="轻译">
+              <span class="brand-mark" aria-hidden="true">译</span>
+              <span class="brand-name" aria-hidden="true">轻译</span>
+            </header>
+            <div class="status-icon" aria-hidden="true"></div>
+            <h1>\(title)</h1>
+            <p class="message">\(message)</p>
+            <footer class="footer"><p>你可以关闭此页面。</p></footer>
+          </main>
+        </body>
+        </html>
+        """
+    }
+}
+
 // Binds only to 127.0.0.1, lives for one OAuth attempt, accepts a bounded HTTP GET.
 final class LoopbackReceiver: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.laowang.qingyi.oauth-loopback")
@@ -135,21 +267,21 @@ final class LoopbackReceiver: @unchecked Sendable {
                 return
             }
             let parts = request.components(separatedBy: "\r\n").first?.split(separator: " ") ?? []
-            guard parts.count == 3, parts[0] == "GET", parts[1].hasPrefix("/auth/callback?") else { self.reply(connection, status: "404 Not Found", message: "Not found"); return }
+            guard parts.count == 3, parts[0] == "GET", parts[1].hasPrefix("/auth/callback?") else { self.reply(connection, page: .notFound); return }
             do {
                 let parsed = try CallbackParser.parse(String(parts[1]), expectedState: self.state, existingClient: self.existingClient)
-                self.reply(connection, status: "200 OK", message: "已收到授权，请返回轻译完成身份验证。")
+                self.reply(connection, page: .received)
                 self.complete(.success((parsed.code, parsed.client)), preserve: connection)
             } catch {
                 // A bad state must not terminate a legitimate pending sign-in.
-                self.reply(connection, status: "400 Bad Request", message: "授权未完成，请返回轻译重新尝试。")
+                self.reply(connection, page: .failed)
                 if let components = URLComponents(string: "http://127.0.0.1" + String(parts[1])), components.queryItems?.first(where: { $0.name == "state" })?.value == self.state { self.complete(.failure(error), preserve: connection) }
             }
         }
     }
-    private func reply(_ connection: NWConnection, status: String, message: String) {
-        let body = Data("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>轻译</title><body style='font:18px system-ui;padding:60px;background:#faf9f6'><h1>轻译</h1><p>\(message)</p></body>".utf8)
-        let header = Data("HTTP/1.1 \(status)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(body.count)\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nConnection: close\r\n\r\n".utf8)
+    private func reply(_ connection: NWConnection, page: OAuthCallbackPage) {
+        let body = Data(page.html.utf8)
+        let header = Data("HTTP/1.1 \(page.httpStatus)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(body.count)\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nConnection: close\r\n\r\n".utf8)
         connection.send(content: header + body, completion: .contentProcessed { _ in connection.cancel(); self.connectionSet.removeValue(forKey: ObjectIdentifier(connection)) })
     }
     private func complete(_ value: Result<(String, String), Error>, preserve: NWConnection? = nil) {

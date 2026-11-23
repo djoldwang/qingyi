@@ -23,6 +23,18 @@ struct QingyiTests {
         _ = try stream.line("data: " + String(data: data, encoding: .utf8)!)
         _ = try stream.line("")
     }
+    static func expectCallbackResponse(_ data: Data, _ response: URLResponse, status: Int, page: OAuthCallbackPage) throws {
+        guard let http = response as? HTTPURLResponse else { throw QingyiError.message("Missing HTTP callback response") }
+        try expect(http.statusCode == status)
+        try expect(http.value(forHTTPHeaderField: "Content-Type") == "text/html; charset=utf-8")
+        try expect(http.value(forHTTPHeaderField: "Content-Length") == String(data.count))
+        try expect(http.value(forHTTPHeaderField: "Cache-Control") == "no-store")
+        try expect(http.value(forHTTPHeaderField: "Content-Security-Policy") == "default-src 'none'; style-src 'unsafe-inline'")
+        try expect(data == Data(page.html.utf8), "HTTP response must use the same template as the reviewed preview")
+        let body = String(decoding: data, as: UTF8.self)
+        for secret in ["callback-secret-sentinel", "wrong-state-sentinel", "oaiapp_fixture"] { try expect(!body.contains(secret), "Callback parameter leaked into the page") }
+        try expect(!body.contains("<script") && !body.contains("<img") && !body.contains("登录成功"))
+    }
     @MainActor static func main() {
         setbuf(stdout, nil)
         if CommandLine.arguments.contains("--native-service-scroll") || Bundle.main.bundleIdentifier == "com.laowang.qingyi.service-scroll-tests" {
@@ -45,6 +57,17 @@ struct QingyiTests {
         NSApplication.shared.run()
     }
     @MainActor static func runTests() async {
+        if let index = CommandLine.arguments.firstIndex(of: "--callback-page-previews"), CommandLine.arguments.count > index + 1 {
+            do {
+                let directory = URL(fileURLWithPath: CommandLine.arguments[index + 1], isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                for page in OAuthCallbackPage.allCases {
+                    try page.html.write(to: directory.appendingPathComponent(page.rawValue + ".html"), atomically: true, encoding: .utf8)
+                }
+                print("Rendered three callback page previews from the production template; no authorization or tests performed")
+            } catch { print("FAIL callback page previews: \(error)"); exit(1) }
+            return
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--builtin-ui-snapshots"), CommandLine.arguments.count > index + 1 {
             do {
                 let recognized = try await VisionScreenshotOCR().recognize(screenshotImage())
@@ -438,23 +461,54 @@ struct QingyiTests {
                 withExtendedLifetime((first, occupied, probe)) { }
             }
         }
-        // Optional live local-network test; no login, model call, or user content.
+        // Optional live local-network tests use disposable callback data only.
         if CommandLine.arguments.contains("--loopback") {
-            do {
-                let receiver = LoopbackReceiver(state: "test-state", existingClient: nil)
+            await asyncCheck("Loopback 404 renders the common page with bounded UTF-8 headers") {
+                let receiver = LoopbackReceiver(state: "fixture-state", existingClient: nil)
+                defer { receiver.cancel() }
+                let url = try await receiver.start()
+                let (data, response) = try await HTTP.session().data(from: url.appendingPathComponent("missing"))
+                try expectCallbackResponse(data, response, status: 404, page: .notFound)
+            }
+            await asyncCheck("Bad state returns 400 without ending the legitimate callback; valid 200 preserves the code") {
+                let receiver = LoopbackReceiver(state: "fixture-state", existingClient: nil)
+                defer { receiver.cancel() }
                 let url = try await receiver.start()
                 try expect(url.host == "127.0.0.1" && url.path == "/auth/callback")
                 var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
-                components.queryItems = [URLQueryItem(name: "state", value: "test-state"), URLQueryItem(name: "code", value: "test-code"), URLQueryItem(name: "client_id", value: "oaiapp_test")]
-                let (_, response) = try await HTTP.session().data(from: components.url!)
+                components.queryItems = [URLQueryItem(name: "state", value: "wrong-state-sentinel"), URLQueryItem(name: "code", value: "<script>callback-secret-sentinel</script>"), URLQueryItem(name: "client_id", value: "oaiapp_fixture")]
+                let (badData, badResponse) = try await HTTP.session().data(from: components.url!)
+                try expectCallbackResponse(badData, badResponse, status: 400, page: .failed)
+                components.queryItems = [URLQueryItem(name: "state", value: "fixture-state"), URLQueryItem(name: "code", value: "callback-secret-sentinel"), URLQueryItem(name: "client_id", value: "oaiapp_fixture")]
+                let (data, response) = try await HTTP.session().data(from: components.url!)
+                try expectCallbackResponse(data, response, status: 200, page: .received)
+                let timeout = Task { try? await Task.sleep(nanoseconds: 5_000_000_000); if !Task.isCancelled { receiver.cancel() } }
+                defer { timeout.cancel() }
                 let (code, client) = try await receiver.wait()
-                try expect((response as? HTTPURLResponse)?.statusCode == 200 && code == "test-code" && client == "oaiapp_test")
-                passed += 1; print("PASS loopback callback end-to-end")
-                let cancelled = LoopbackReceiver(state: "other", existingClient: nil)
-                _ = try await cancelled.start(); cancelled.cancel()
-                do { _ = try await cancelled.wait(); failed += 1; print("FAIL callback cancellation") }
-                catch is CancellationError { passed += 1; print("PASS callback cancellation") }
-            } catch { failed += 1; print("FAIL loopback callback: \(error.localizedDescription)") }
+                try expect(code == "callback-secret-sentinel" && client == "oaiapp_fixture")
+            }
+            await asyncCheck("Declined authorization renders the failure page and ends that attempt") {
+                let receiver = LoopbackReceiver(state: "fixture-state", existingClient: "oaiapp_fixture")
+                defer { receiver.cancel() }
+                let url = try await receiver.start()
+                var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+                components.queryItems = [URLQueryItem(name: "state", value: "fixture-state"), URLQueryItem(name: "error", value: "access_denied"), URLQueryItem(name: "error_description", value: "callback-secret-sentinel")]
+                let (data, response) = try await HTTP.session().data(from: components.url!)
+                try expectCallbackResponse(data, response, status: 400, page: .failed)
+                let timeout = Task { try? await Task.sleep(nanoseconds: 5_000_000_000); if !Task.isCancelled { receiver.cancel() } }
+                defer { timeout.cancel() }
+                var rejected = false
+                do { _ = try await receiver.wait() }
+                catch is CancellationError { throw QingyiError.message("Declined authorization did not finish before timeout") }
+                catch { rejected = true }
+                try expect(rejected)
+            }
+            await asyncCheck("Loopback callback cancellation remains immediate") {
+                let receiver = LoopbackReceiver(state: "fixture-state", existingClient: nil)
+                _ = try await receiver.start(); receiver.cancel()
+                do { _ = try await receiver.wait(); throw QingyiError.message("Cancellation was ignored") }
+                catch is CancellationError { }
+            }
         }
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)

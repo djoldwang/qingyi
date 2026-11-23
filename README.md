@@ -2,7 +2,7 @@
 
 **1.0.3** · 在 Mac 上选中外语、悬停在段落上，或框选图片中的文字，就能在同一个浮窗对照中文译文。支持 Apple Silicon 和 macOS 14 及更高版本。
 
-当前维护构建为 1.0.3（build 66），修复同邮箱 ChatGPT 连接隔离。已发布版本入口为 [1.0.3](https://github.com/djoldwang/qingyi/releases/tag/v1.0.3)。
+当前正式版本为 [1.0.3](https://github.com/djoldwang/qingyi/releases/tag/v1.0.3)。相对 1.0.2 的完整更新见[版本记录](CHANGELOG.md)。
 
 [下载 1.0.3](https://github.com/djoldwang/qingyi/releases/tag/v1.0.3) · [使用手册](docs/usage.md) · [版本记录](CHANGELOG.md)
 
