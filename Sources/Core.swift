@@ -9,19 +9,17 @@ enum QingyiError: LocalizedError {
 }
 
 enum CredentialWait {
-    static func value<T>(_ task: Task<T, Error>, timeout: UInt64 = 15_000_000_000) async throws -> T {
+    // SecurityAgent waits for a person, not a server. Keep the request pending
+    // until access succeeds or fails, while allowing each caller to cancel its
+    // own wait without cancelling the shared, blocking Keychain operation.
+    static func value<T>(_ task: Task<T, Error>) async throws -> T {
+        try Task.checkCancellation()
         let stream = AsyncThrowingStream<T, Error>(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let waiter = Task {
                 do { continuation.yield(try await task.value); continuation.finish() }
                 catch { continuation.finish(throwing: error) }
             }
-            let timer = Task {
-                do {
-                    try await Task.sleep(nanoseconds: timeout)
-                    continuation.finish(throwing: QingyiError.message("macOS 钥匙串访问尚未完成。请确认登录钥匙串已解锁，或处理系统访问提示后重试。"))
-                } catch { }
-            }
-            continuation.onTermination = { _ in waiter.cancel(); timer.cancel() }
+            continuation.onTermination = { _ in waiter.cancel() }
         }
         var iterator = stream.makeAsyncIterator()
         let value = try await iterator.next()
@@ -55,7 +53,7 @@ func formBody(_ fields: [String: String]) -> Data {
 }
 
 enum AppVersion {
-    static var display: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.2" }
+    static var display: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.3" }
     static var menuTitle: String { "轻译 \(display)" }
 }
 
@@ -223,10 +221,155 @@ enum CredentialStore {
     }
 }
 
+enum FastTranslationFallbackReason: LocalizedError, Equatable {
+    case unsupportedParameter, invalidParameter, emptyTranslation
+
+    static func checkEmptyResponse(_ response: HTTPURLResponse, receivedBytes: Bool) throws {
+        guard !receivedBytes else { return }
+        let length = response.value(forHTTPHeaderField: "Content-Length")
+        // The byte stream reached a clean EOF; HTTP/2 and chunked responses may omit the length.
+        if response.statusCode == 204 || (response.statusCode == 200 && (length == nil || length == "0")) {
+            throw Self.emptyTranslation
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedParameter: return "当前服务不支持此模型的快速翻译参数。"
+        case .invalidParameter: return "当前服务未接受本次快速翻译参数。"
+        case .emptyTranslation: return "模型已完成请求，但没有返回可用译文。"
+        }
+    }
+}
+
+// Match only the control actually sent in this request. An error can mention
+// reasoning as context while rejecting a different parameter such as temperature.
+enum FastTranslationParameter: String {
+    case thinking, reasoning, reasoningEffort = "reasoning_effort"
+
+    var value: Any {
+        switch self {
+        case .thinking: return ["type": "disabled"]
+        case .reasoning: return ["effort": "none"]
+        case .reasoningEffort: return "none"
+        }
+    }
+
+    private var acceptedPaths: [String] {
+        switch self {
+        case .thinking: return ["thinking", "thinking.type"]
+        case .reasoning: return ["reasoning", "reasoning.effort"]
+        case .reasoningEffort: return ["reasoning_effort"]
+        }
+    }
+
+    func checkRejection(body: Data) throws {
+        if let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+            try checkRejection(in: object)
+        } else if let message = String(data: body, encoding: .utf8), !message.contains("<") {
+            try checkRejection(in: ["message": message])
+        }
+    }
+
+    func checkRejection(in envelope: [String: Any]) throws {
+        let response = envelope["response"] as? [String: Any]
+        let error = envelope["error"] as? [String: Any] ?? response?["error"] as? [String: Any] ?? envelope
+        let code = (error["code"] as? String ?? error["type"] as? String ?? "").lowercased()
+        let blocked = ["quota", "rate_limit", "billing", "balance", "credit", "auth", "api_key", "permission", "access_denied", "content_filter", "content_policy", "safety", "overloaded", "server_error"]
+        guard !blocked.contains(where: code.contains) else { return }
+        let message = (error["message"] as? String ?? error["detail"] as? String ?? error["error"] as? String ?? "").lowercased()
+        let temporary = ["temporarily", "try again later", "暂时", "临时", "稍后重试"].contains(where: message.contains)
+        let rejection: FastTranslationFallbackReason = temporary ? .invalidParameter : .unsupportedParameter
+        if let items = envelope["detail"] as? [[String: Any]] {
+            for item in items {
+                guard let location = item["loc"] as? [String], location.first == "body",
+                      acceptedPaths.contains(location.dropFirst().joined(separator: ".")) else { continue }
+                if ["extra_forbidden", "literal_error", "enum"].contains(item["type"] as? String ?? "") {
+                    throw rejection
+                }
+            }
+        }
+        if let param = error["param"] as? String, !param.isEmpty {
+            guard acceptedPaths.contains(param.lowercased()) else { return }
+            let unsupportedCodes = ["unsupported_parameter", "unsupported_value", "unknown_parameter", "unrecognized_parameter"]
+            let unsupportedMessages = ["unsupported", "not supported", "does not support", "not permitted", "not allowed", "unknown parameter", "unrecognized", "must be one of", "不支持", "不允许", "未知参数"]
+            if unsupportedCodes.contains(code) || unsupportedMessages.contains(where: message.contains) {
+                throw rejection
+            }
+            // A generic validation failure can justify one retry without establishing a lasting capability.
+            if ["invalid_value", "invalid_parameter"].contains(code) || message.contains("invalid") || message.contains("无效") {
+                throw FastTranslationFallbackReason.invalidParameter
+            }
+            return
+        }
+        let sentValue = self == .thinking ? "disabled" : "none"
+        let paths = acceptedPaths.map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|")
+        let control = "(?<![a-z0-9_.-])(?:\(paths))(?:\\.\(sentValue))?(?![a-z0-9_.-])"
+        let marks = #"[\s:'"\x{60}“”‘’：]*"#
+        let invalid = #"(?:unsupported|unknown|unrecogni[sz]ed|unexpected|not supported|does not support|不支持|未知|不允许)"#
+        let prefix = invalid + #"(?: request)?(?: (?:argument|parameter|field|key|value)(?: supplied)?)?(?: the)?(?:参数|字段)?"# + marks + control
+        let suffix = control + marks + #"(?:(?:mode|parameter|field|模式|参数)\s*)?(?:(?:is|are)\s+)?(?:not supported|unsupported|not permitted|not allowed|unrecogni[sz]ed|不支持|不允许)"#
+        let valueRejection = #"(?:invalid|unsupported) value"# + marks + sentValue + marks
+            + #"(?:is )?not supported (?:with|for) [^\n;]{0,72}?"# + control
+        if message.range(of: [prefix, suffix, valueRejection].joined(separator: "|"), options: .regularExpression) != nil {
+            throw rejection
+        }
+    }
+}
+
+// Retain only protocol evidence about the completed translation. Reasoning
+// text (including encrypted/redacted material) is never saved or displayed.
+enum TranslationThinkingEvidence: Equatable {
+    case unreported, confirmedOff, used
+
+    mutating func observeMetadata(_ object: [String: Any]) {
+        guard self != .used else { return }
+        if let usage = object["usage"] as? [String: Any] {
+            for field in ["completion_tokens_details", "output_tokens_details"] {
+                let details = usage[field] as? [String: Any]
+                if let count = details?["reasoning_tokens"] as? NSNumber,
+                   CFGetTypeID(count) != CFBooleanGetTypeID(), count.intValue > 0 {
+                    self = .used
+                    return
+                }
+            }
+        }
+        let thinking = object["thinking"] as? [String: Any]
+        let reasoning = object["reasoning"] as? [String: Any]
+        if thinking?["type"] as? String == "disabled" || reasoning?["effort"] as? String == "none" || object["reasoning_effort"] as? String == "none" {
+            self = .confirmedOff
+        }
+    }
+
+    mutating func observeResponse(_ response: [String: Any]) {
+        observeMetadata(response)
+        if let output = response["output"] as? [[String: Any]], output.contains(where: Self.isReasoningItem) {
+            self = .used
+        }
+    }
+
+    static func hasText(_ value: Any?) -> Bool {
+        guard let text = value as? String else { return false }
+        return !text.isEmpty && text.rangeOfCharacter(from: .whitespacesAndNewlines.inverted) != nil
+    }
+
+    static func isReasoningItem(_ item: [String: Any]) -> Bool {
+        guard item["type"] as? String == "reasoning" else { return false }
+        if hasText(item["encrypted_content"]) { return true }
+        // An empty reasoning item can be emitted even with no reasoning.
+        return ["summary", "content"].contains { field in
+            (item[field] as? [[String: Any]])?.contains { hasText($0["text"]) } == true
+        }
+    }
+}
+
 // Stateful SSE parser, kept independent of URLSession so fragmented/multi-line events can be tested.
 struct ResponseStream {
     var dataLines: [String] = []
+    var fastParameter: FastTranslationParameter?
+    private var refused = false
     private(set) var text = ""
+    private(set) var thinkingEvidence = TranslationThinkingEvidence.unreported
     private(set) var completed = false
     mutating func line(_ raw: String) throws -> String? {
         let line = raw.hasSuffix("\r") ? String(raw.dropLast()) : raw
@@ -240,28 +383,54 @@ struct ResponseStream {
         if payload == "[DONE]" { return nil }
         guard let data = payload.data(using: .utf8), let event = try JSONSerialization.jsonObject(with: data) as? [String: Any], let type = event["type"] as? String else { throw QingyiError.message("翻译响应格式错误，请重试。") }
         switch type {
+        case "response.refusal.delta", "response.refusal.done":
+            refused = true
+            return nil
+        case "response.content_part.added", "response.content_part.done":
+            if (event["part"] as? [String: Any])?["type"] as? String == "refusal" { refused = true }
+            return nil
+        case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+            if TranslationThinkingEvidence.hasText(event["delta"]) { thinkingEvidence = .used }
+            return nil
+        case "response.output_item.added", "response.output_item.done":
+            if let item = event["item"] as? [String: Any] {
+                if TranslationThinkingEvidence.isReasoningItem(item) { thinkingEvidence = .used }
+                if Self.containsRefusal([item]) { refused = true }
+            }
+            return nil
         case "response.output_text.delta":
             guard !completed else { return nil }
             text += event["delta"] as? String ?? ""
             return text
         case "response.completed":
-            let response = event["response"] as? [String: Any]
-            guard response?["status"] as? String == "completed" else { throw QingyiError.message("翻译未完整结束，请重试。") }
+            guard let response = event["response"] as? [String: Any], response["status"] as? String == "completed" else { throw QingyiError.message("翻译未完整结束，请重试。") }
+            thinkingEvidence.observeResponse(response)
+            if let output = response["output"] as? [[String: Any]], Self.containsRefusal(output) { refused = true }
             // Some models return only the final output rather than text deltas.
-            if text.isEmpty, let output = response?["output"] as? [[String: Any]] {
+            if text.isEmpty, let output = response["output"] as? [[String: Any]] {
                 text = output.flatMap { $0["content"] as? [[String: Any]] ?? [] }.filter { $0["type"] as? String == "output_text" }.compactMap { $0["text"] as? String }.joined()
             }
             completed = true
             return text
-        case "response.failed", "response.incomplete", "error":
+        case "response.failed", "error":
+            if !refused, TextPolicy.clean(text).isEmpty { try fastParameter?.checkRejection(in: event) }
+            throw QingyiError.message("模型未能完成翻译，请重试或在设置中切换模型。")
+        case "response.incomplete":
             throw QingyiError.message("模型未能完成翻译，请重试或在设置中切换模型。")
         default: return nil
         }
     }
     mutating func finish() throws -> String {
         _ = try line("")
-        guard completed, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw QingyiError.message("翻译连接提前结束，结果不完整，请重试。") }
+        guard completed else { throw QingyiError.message("翻译连接提前结束，结果不完整，请重试。") }
+        guard !refused else { throw QingyiError.message("模型拒绝了本次翻译。") }
+        guard !TextPolicy.clean(text).isEmpty else { throw FastTranslationFallbackReason.emptyTranslation }
         return text
+    }
+    static func containsRefusal(_ output: [[String: Any]]) -> Bool {
+        output.contains { item in
+            (item["content"] as? [[String: Any]])?.contains { $0["type"] as? String == "refusal" } == true
+        }
     }
 }
 
@@ -297,8 +466,14 @@ struct TranslationDecoder {
     private(set) var format: Format = .unknown
     private var stream = ResponseStream()
     private var json = ""
+    private var jsonThinkingEvidence = TranslationThinkingEvidence.unreported
+    var thinkingEvidence: TranslationThinkingEvidence { format == .json ? jsonThinkingEvidence : stream.thinkingEvidence }
     private var eventSize = 0
     let contentType: String
+    init(contentType: String, fastParameter: FastTranslationParameter? = nil) {
+        self.contentType = contentType
+        stream.fastParameter = fastParameter
+    }
     var completed: Bool { (format == .sse || format == .jsonEvents) && stream.completed }
     mutating func line(_ raw: String) throws -> String? {
         var line = raw
@@ -336,16 +511,19 @@ struct TranslationDecoder {
     mutating func finish() throws -> String {
         if format == .sse || format == .jsonEvents { return try stream.finish() }
         guard format == .json, let data = json.data(using: .utf8), let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw QingyiError.message("翻译接口没有返回完整结果，请重试。") }
-        if let error = object["error"] as? [String: Any] {
-            let code = error["code"] as? String ?? "unknown"
+        if let error = object["error"], !(error is NSNull) {
+            try stream.fastParameter?.checkRejection(in: object)
+            let code = (error as? [String: Any])?["code"] as? String ?? "unknown"
             throw QingyiError.message("翻译服务返回错误（\(code)），请重试或切换模型。")
         }
         let response: [String: Any]
         if object["type"] as? String == "response.completed", let wrapped = object["response"] as? [String: Any] { response = wrapped }
         else { response = object }
         guard response["status"] as? String == "completed", let output = response["output"] as? [[String: Any]] else { throw QingyiError.message("模型未返回已完成的翻译结果，请重试或切换模型。") }
+        guard !ResponseStream.containsRefusal(output) else { throw QingyiError.message("模型拒绝了本次翻译。") }
+        jsonThinkingEvidence.observeResponse(response)
         let text = output.flatMap { $0["content"] as? [[String: Any]] ?? [] }.filter { $0["type"] as? String == "output_text" }.compactMap { $0["text"] as? String }.joined()
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw QingyiError.message("模型没有返回可用译文，请重试或切换模型。") }
+        guard !TextPolicy.clean(text).isEmpty else { throw FastTranslationFallbackReason.emptyTranslation }
         return text
     }
 }

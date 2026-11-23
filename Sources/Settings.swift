@@ -125,6 +125,7 @@ struct SettingsView: View {
     var preview: () -> Void
     var verify: () -> Void
     // Snapshot fixtures skip credential restoration and real model discovery.
+    var services = BuiltinTranslationSettings()
     var loadsAccounts = true
     var apiClient = CustomAPIClient()
     var requestSystemPermission: (() -> Void)? = nil
@@ -152,7 +153,7 @@ struct SettingsView: View {
                                 case .selection: selectionSettings
                                 case .window: windowSettings
                                 case .services:
-                                    TranslationServiceSettings(api: api, chat: chat, verify: verify,
+                                    TranslationServiceSettings(api: api, chat: chat, services: services, verify: verify,
                                         edit: { navigation.open(.services, detail: .api($0)) },
                                         manageAccount: { navigation.open(.services, detail: .account) })
                                 case .general: generalSettings

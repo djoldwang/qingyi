@@ -19,6 +19,7 @@ final class MemoryAPIKeyVault: APIKeyVault {
 
 final class FixtureAPIProtocol: URLProtocol {
     static var handle: ((URLRequest) throws -> (Int, String, Data))?
+    static var scheduleResponse: ((URLRequest, @escaping () -> Void) -> Void)?
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -26,12 +27,23 @@ final class FixtureAPIProtocol: URLProtocol {
             guard let handle = Self.handle else { throw QingyiError.message("Missing fixture") }
             let (status, contentType, data) = try handle(request)
             let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": contentType])!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            // Deliberately fragment Unicode and SSE lines across transport chunks.
-            for start in stride(from: 0, to: data.count, by: 3) {
-                client?.urlProtocol(self, didLoad: data.subdata(in: start..<min(start + 3, data.count)))
+            let deliver = { [self] in
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                // Deliberately fragment Unicode and SSE lines across transport chunks.
+                for start in stride(from: 0, to: data.count, by: 3) {
+                    client?.urlProtocol(self, didLoad: data.subdata(in: start..<min(start + 3, data.count)))
+                }
+                client?.urlProtocolDidFinishLoading(self)
             }
-            client?.urlProtocolDidFinishLoading(self)
+            if let schedule = Self.scheduleResponse {
+                let loop = CFRunLoopGetCurrent()!
+                schedule(request) {
+                    CFRunLoopPerformBlock(loop, CFRunLoopMode.defaultMode.rawValue, deliver)
+                    CFRunLoopWakeUp(loop)
+                }
+            } else {
+                deliver()
+            }
         } catch { client?.urlProtocol(self, didFailWithError: error) }
     }
     override func stopLoading() { }
@@ -59,7 +71,7 @@ extension QingyiTests {
         let url = URL(fileURLWithPath: directory, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         func render<V: View>(_ view: V, name: String, size: NSSize, dark: Bool = false) throws {
-            let hosting = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)).environment(\.colorScheme, dark ? .dark : .light))
+            let hosting = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)).environment(\.controlActiveState, .active).environment(\.colorScheme, dark ? .dark : .light))
             hosting.frame = NSRect(origin: .zero, size: size)
             hosting.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
             let window = NSWindow(contentRect: hosting.frame, styleMask: [.borderless], backing: .buffered, defer: false)
@@ -77,15 +89,21 @@ extension QingyiTests {
         try NSBitmapImageRep(cgImage: screenshot).representation(using: .png, properties: [:])!.write(to: url.appendingPathComponent("ocr-english-sample.png"))
         try render(APIProviderEditor(api: store, provider: store.activeProvider!), name: "api-editor.png", size: NSSize(width: 650, height: 730))
         try render(APIProviderEditor(api: store, provider: store.activeProvider!), name: "api-editor-dark.png", size: NSSize(width: 650, height: 730), dark: true)
-        try render(SettingsView(preferences: Preferences(defaults: defaults), chat: ChatGPT(defaults: defaults), api: store, navigation: SettingsNavigation(section: .services), updateShortcut: { _ in true }, shortcutRecording: { _ in }, preview: {}, verify: {}, loadsAccounts: false), name: "settings-custom-api.png", size: NSSize(width: 900, height: 680))
+        try render(SettingsView(preferences: Preferences(defaults: defaults), chat: ChatGPT(defaults: defaults), api: store, navigation: SettingsNavigation(section: .services), updateShortcut: { _ in true }, shortcutRecording: { _ in }, preview: {}, verify: {}, services: BuiltinTranslationSettings(defaults: defaults), loadsAccounts: false), name: "settings-custom-api.png", size: NSSize(width: 900, height: 680))
+        let freshDomain = "qingyi-fresh-ui-" + UUID().uuidString
+        let freshDefaults = UserDefaults(suiteName: freshDomain)!
+        defer { freshDefaults.removePersistentDomain(forName: freshDomain) }
+        try render(SettingsView(preferences: Preferences(defaults: freshDefaults), chat: ChatGPT(defaults: freshDefaults), api: APIConfigurationStore(defaults: freshDefaults, vault: MemoryAPIKeyVault()), navigation: SettingsNavigation(section: .services), updateShortcut: { _ in true }, shortcutRecording: { _ in }, preview: {}, verify: {}, services: BuiltinTranslationSettings(defaults: freshDefaults), loadsAccounts: false), name: "settings-fresh-ai.png", size: NSSize(width: 900, height: 680))
+
         let settingsPreferences = Preferences(defaults: defaults)
         settingsPreferences.trusted = true
+        settingsPreferences.hoverEnabled = true
         settingsPreferences.excluded = ["com.apple.Notes", "com.apple.Terminal"]
         let settingsChat = ChatGPT(defaults: defaults)
         func settings(_ section: SettingsSection, detail: SettingsDetail? = nil) -> SettingsView {
             SettingsView(preferences: settingsPreferences, chat: settingsChat, api: store,
                 navigation: SettingsNavigation(section: section, detail: detail),
-                updateShortcut: { _ in true }, shortcutRecording: { _ in }, preview: {}, verify: {}, loadsAccounts: false)
+                updateShortcut: { _ in true }, shortcutRecording: { _ in }, preview: {}, verify: {}, services: BuiltinTranslationSettings(defaults: defaults), loadsAccounts: false)
         }
         for section in SettingsSection.allCases {
             try render(settings(section), name: "settings-\(section.rawValue)-light.png", size: NSSize(width: 900, height: 680))
@@ -129,6 +147,24 @@ extension QingyiTests {
         }
         floating.loading = false; floating.modelSelectionEnabled = false; floating.status = "界面预览 · 未调用模型"
         try render(TranslationCard(state: floating, close: {}, retry: {}, settings: {}), name: "compact-disabled.png", size: loadingSize)
+
+        var fastProvider = fixtureProvider()
+        fastProvider.name = "自定义 API"
+        fastProvider.models = [APIModel(id: "deepseek-v4-flash", name: "deepseek-v4-flash")]
+        try store.save(fastProvider, replacementKey: "fixture-only")
+        try store.selectProvider(fastProvider.id)
+        let key = ModelReasoningKey(provider: fastProvider, modelID: fastProvider.models[0].id)
+        store.recordThinkingStatus(.requestedOffUnconfirmed, for: key)
+        try render(settings(.services), name: "settings-fast-translation.png", size: NSSize(width: 900, height: 680))
+        store.setFastTranslation(false, for: key)
+        store.recordThinkingStatus(.usedThinking, for: key)
+        try render(settings(.services), name: "settings-fast-translation-dark.png", size: NSSize(width: 780, height: 600), dark: true)
+        store.setFastTranslation(true, for: key)
+        store.recordThinkingStatus(.usedThinking, for: key, usedDefaultRetry: true)
+        try render(settings(.services), name: "settings-default-retry.png", size: NSSize(width: 780, height: 600))
+        store.rememberFastTranslationRejection(for: key, generation: store.fastTranslationRejectionGeneration(for: key))
+        store.recordThinkingStatus(.unreported, for: key)
+        try render(settings(.services), name: "settings-remembered-gateway.png", size: NSSize(width: 860, height: 680))
     }
     @MainActor static func asyncCheck(_ name: String, _ body: () async throws -> Void) async {
         do { try await body(); passed += 1; print("PASS \(name)") }
@@ -173,7 +209,7 @@ extension QingyiTests {
             defer { defaults.removePersistentDomain(forName: domain) }
             let vault = MemoryAPIKeyVault()
             let store = APIConfigurationStore(defaults: defaults, vault: vault)
-            try expect(store.activeProviderID.isEmpty)
+            try expect(store.isUnconfigured)
             var first = fixtureProvider()
             first.models[0].supportsImages = true
             first.models[0].maximumOutputTokens = 4096

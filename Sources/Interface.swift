@@ -238,6 +238,7 @@ final class FloatingState: ObservableObject {
     @Published var loadingChatGPTModels = false
     @Published var modelMenuMessage = ""
     @Published var pinned = false
+    @Published var services: [ServiceTranslationResult] = []
 }
 
 struct TranslationCard: View {
@@ -251,6 +252,7 @@ struct TranslationCard: View {
     var restoreModel: (UUID) -> Void = { _ in }
     var loadModels: (UUID) -> Void = { _ in }
     var togglePin: () -> Void = {}
+    var retryService: (TranslationServiceID) -> Void = { _ in }
     private let accent = Color(red: 0.27, green: 0.32, blue: 0.83)
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -267,22 +269,32 @@ struct TranslationCard: View {
                 Button(action: close) { Image(systemName: "xmark").font(.system(size: 11, weight: .medium)).frame(width: 23, height: 23) }.buttonStyle(.plain).help("关闭（Esc）").accessibilityLabel("关闭翻译")
             }.padding(.horizontal, 12).frame(height: TranslationWindowLayout.headerHeight)
             Divider().opacity(0.5)
-            TranslationBodyScrollArea(source: state.source, text: state.text, error: state.error, dark: colorScheme == .dark, fontSize: state.fontSize)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if state.services.isEmpty {
+                TranslationBodyScrollArea(source: state.source, text: state.text, error: state.error, dark: colorScheme == .dark, fontSize: state.fontSize)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ServicesScrollArea(bodyView: ServiceResultsBody(state: state, retry: retryService, modelMenuTracking: modelMenuTracking, selectModel: selectModel, restoreModel: restoreModel, loadModels: loadModels))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             Divider().opacity(0.5)
             HStack(spacing: 8) {
-                TemporaryModelPicker(state: state, tracking: modelMenuTracking, select: selectModel, restore: restoreModel, load: loadModels)
-                    .frame(minWidth: 64).frame(height: 24)
-                if state.temporaryModel {
+                if state.services.isEmpty {
+                    TemporaryModelPicker(state: state, tracking: modelMenuTracking, select: selectModel, restore: restoreModel, load: loadModels)
+                        .frame(minWidth: 64).frame(height: 24)
+                } else {
+                    Button(action: settings) { Image(systemName: "slider.horizontal.3") }.help("翻译服务设置")
+                    Text("\(state.services.count) 个服务").foregroundStyle(.secondary)
+                }
+                if state.temporaryModel && state.services.isEmpty {
                     Text("本次").font(.system(size: 9)).foregroundStyle(.secondary)
                         .fixedSize().help("临时模型，仅当前译文生效")
                 }
                 Spacer(minLength: 0)
-                if state.error {
+                if state.services.isEmpty && state.error {
                     Button("设置", action: settings).fixedSize().frame(minHeight: 24)
                     Button("重试", action: retry).fixedSize().frame(minHeight: 24)
                 }
-                else {
+                else if state.services.isEmpty {
                     Button {
                         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(state.text, forType: .string)
                     } label: { Image(systemName: "doc.on.doc").frame(width: 24, height: 24) }
@@ -370,6 +382,7 @@ final class FloatingController {
     let hoverButton = HoverButton(frame: NSRect(x: 0, y: 0, width: 38, height: 38))
     var onTrigger: (() -> Void)?
     var onClose: (() -> Void)?
+    var onRetryService: ((TranslationServiceID) -> Void)?
     var onRetry: (() -> Void)?
     var onSettings: (() -> Void)?
     var onModelMenuTracking: ((Bool) -> Void)?
@@ -428,7 +441,7 @@ final class FloatingController {
         }
         resultPanel.contentView = NSHostingView(rootView: TranslationCard(state: state, close: { [weak self] in self?.onClose?() }, retry: { [weak self] in self?.onRetry?() }, settings: { [weak self] in self?.onSettings?() }, modelMenuTracking: { [weak self] tracking in
             self?.handleModelMenuTracking(tracking)
-        }, selectModel: { [weak self] choice, id in self?.onSelectModel?(choice, id) }, restoreModel: { [weak self] id in self?.onRestoreModel?(id) }, loadModels: { [weak self] id in self?.onLoadModels?(id) }, togglePin: { [weak self] in self?.state.pinned.toggle() }))
+        }, selectModel: { [weak self] choice, id in self?.onSelectModel?(choice, id) }, restoreModel: { [weak self] id in self?.onRestoreModel?(id) }, loadModels: { [weak self] id in self?.onLoadModels?(id) }, togglePin: { [weak self] in self?.state.pinned.toggle() }, retryService: { [weak self] in self?.onRetryService?($0) }))
         stateSubscription = state.objectWillChange.sink { [weak self] _ in
             guard let self = self, !self.resizeScheduled else { return }
             self.resizeScheduled = true
@@ -486,8 +499,8 @@ final class FloatingController {
     func showResult(source: String, preview: Bool = false, keepPosition: Bool = false, position: TranslationWindowPosition = .upperRight) {
         let reposition = (!keepPosition && !state.pinned) || !resultPanel.isVisible
         hoverButton.cancelHover(); buttonPanel.orderOut(nil)
-        state.source = source; state.text = ""; state.error = false; state.loading = !preview; state.complete = false
-        if preview { state.modelSelectionEnabled = false; state.choice = nil; state.defaultChoice = nil; state.temporaryModel = false }
+        state.source = source; state.text = ""; state.services = []; state.error = false; state.loading = !preview; state.complete = false
+        if preview { state.services = []; state.modelSelectionEnabled = false; state.choice = nil; state.defaultChoice = nil; state.temporaryModel = false }
         state.status = preview ? "界面预览 · 未调用模型" : "正在翻译 · ChatGPT"
         if reposition {
             placement = position; anchorPointer = NSEvent.mouseLocation; manualTopLeft = nil
@@ -500,7 +513,7 @@ final class FloatingController {
     func hide() {
         ModelMenuButton.cancelPresentedMenu(); TranslationResultTextView.cancelPresentedMenu()
         hoverButton.cancelHover(); buttonPanel.orderOut(nil); resultPanel.orderOut(nil)
-        state.source = ""; state.text = ""; state.complete = false
+        state.source = ""; state.text = ""; state.complete = false; state.services = []
         state.sessionID = UUID(); state.modelSelectionEnabled = false; state.choice = nil; state.defaultChoice = nil
         state.temporaryModel = false; state.modelMenuMessage = ""; state.loadingChatGPTModels = false
         state.pinned = false; manualTopLeft = nil
@@ -518,7 +531,15 @@ final class FloatingController {
     func hideButton() { hoverButton.cancelHover(); buttonPanel.orderOut(nil) }
     func fitContent(requireVisible: Bool = true) {
         guard (!requireVisible || resultPanel.isVisible), !draggingWindow else { return }
-        let height = TranslationWindowLayout.contentHeight(source: state.source, text: state.text, error: state.error, fontSize: state.fontSize)
+        let height: CGFloat
+        if state.services.isEmpty {
+            height = TranslationWindowLayout.contentHeight(source: state.source, text: state.text, error: state.error, fontSize: state.fontSize)
+        } else {
+            let body = ServiceResultsBody(state: state, retry: { _ in }, modelMenuTracking: { _ in }, selectModel: { _, _ in }, restoreModel: { _ in }, loadModels: { _ in })
+            let host = NSHostingView(rootView: body)
+            host.layoutSubtreeIfNeeded()
+            height = ceil(host.fittingSize.height) + TranslationWindowLayout.headerHeight + TranslationWindowLayout.footerHeight + 2
+        }
         let frame = TranslationWindowLayout.frame(contentHeight: height, position: placement, pointer: anchorPointer, screen: placementScreen, manualTopLeft: manualTopLeft)
         if resultPanel.frame != frame {
             settingFrame = true; resultPanel.setFrame(frame, display: true); settingFrame = false

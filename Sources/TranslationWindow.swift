@@ -188,7 +188,8 @@ struct TranslationBodyScrollArea: NSViewRepresentable {
 }
 
 final class TranslationBodyScrollView: NSScrollView {
-    private let hosting = NSHostingView(rootView: TranslationBody(source: "", text: "", error: false))
+    private let hosting = NSHostingView(rootView: AnyView(TranslationBody(source: "", text: "", error: false)))
+    private var servicesSource: String?
     private var currentBody: TranslationBody?
     private var bodyHeight: CGFloat = 0
     private var allowsScrolling = false
@@ -209,7 +210,15 @@ final class TranslationBodyScrollView: NSScrollView {
         guard body != currentBody else { return }
         let reset = currentBody?.source != body.source || body.text.isEmpty ||
             !(body.text.hasPrefix(currentBody?.text ?? ""))
-        currentBody = body; hosting.rootView = body
+        currentBody = body; hosting.rootView = AnyView(body)
+        hosting.layoutSubtreeIfNeeded()
+        bodyHeight = ceil(hosting.fittingSize.height)
+        layoutBody(reset: reset)
+    }
+    func updateServices(_ body: ServiceResultsBody, source: String) {
+        let reset = servicesSource != source
+        servicesSource = source; currentBody = nil
+        hosting.rootView = AnyView(body)
         hosting.layoutSubtreeIfNeeded()
         bodyHeight = ceil(hosting.fittingSize.height)
         layoutBody(reset: reset)

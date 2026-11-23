@@ -80,7 +80,8 @@ final class ChatGPT: ObservableObject {
         defaults.set(value, forKey: "hostID"); return value
     }
     // Opening settings must never wait for SecurityAgent on the UI thread.
-    // Reuse the existing coalesced, time-limited request credential path.
+    // Reuse the coalesced, cancellable request credential path, including while
+    // the user is still responding to the system authorization prompt.
     func restoreForSettings() {
         guard !loadedCredentials, settingsRestoreTask == nil else { return }
         let client = activeID; let run = generation
@@ -281,10 +282,12 @@ final class ChatGPT: ObservableObject {
         if let existing = credentialRead { pending = existing }
         else {
             let vault = self.vault
+            let focus = CredentialWindowReturnCoordinator.shared.begin()
             pending = (UUID(), Task.detached { try vault.read(client) })
             credentialRead = pending
             Task { @MainActor [weak self] in
                 _ = try? await pending.1.value
+                CredentialWindowReturnCoordinator.shared.end(focus)
                 if self?.credentialRead?.0 == pending.0 { self?.credentialRead = nil }
             }
         }
@@ -369,12 +372,18 @@ final class ChatGPT: ObservableObject {
         temporaryModels = choices; temporaryModelsAccountID = client
         return choices
     }
-    static func translationBody(text: String, model: String) throws -> Data {
-        try JSONSerialization.data(withJSONObject: ["model": model, "store": false, "stream": true,
+    static func translationBody(text: String, model: String, fastTranslation: Bool = false) throws -> Data {
+        var body: [String: Any] = ["model": model, "store": false, "stream": true,
             "instructions": TranslationPrompt.text,
-            "input": [["role": "user", "content": text]]])
+            "input": [["role": "user", "content": text]]]
+        if fastTranslation && FastTranslationCapability.supportsChatGPT(modelID: model) {
+            body["reasoning"] = ["effort": "none"]
+        }
+        return try JSONSerialization.data(withJSONObject: body)
     }
-    func translate(_ raw: String, using requestedModel: String? = nil, accountID: String? = nil, diagnostic: ((String) -> Void)? = nil, onUpdate: @escaping @MainActor (String) -> Void) async throws -> String {
+    func translate(_ raw: String, using requestedModel: String? = nil, accountID: String? = nil, diagnostic: ((String) -> Void)? = nil,
+                   fastTranslation: Bool = false, onThinking: @escaping @MainActor (TranslationThinkingEvidence) -> Void = { _ in },
+                   onUpdate: @escaping @MainActor (String) -> Void) async throws -> String {
         try Task.checkCancellation()
         let text = try TextPolicy.validate(raw)
         let client = activeID; let run = generation
@@ -393,7 +402,8 @@ final class ChatGPT: ObservableObject {
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        request.httpBody = try Self.translationBody(text: text, model: selectedModel)
+        request.httpBody = try Self.translationBody(text: text, model: selectedModel, fastTranslation: fastTranslation)
+        let parameter: FastTranslationParameter? = fastTranslation && FastTranslationCapability.supportsChatGPT(modelID: selectedModel) ? .reasoning : nil
         let (bytes, response) = try await session.bytes(for: request)
         if let http = response as? HTTPURLResponse {
             diagnostic?("HTTP status: \(http.statusCode)")
@@ -401,11 +411,17 @@ final class ChatGPT: ObservableObject {
         }
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             var body = Data()
-            for try await byte in bytes { body.append(byte); if body.count > 16_384 { break } }
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                body.append(byte)
+                if body.count == 16_384 { break }
+            }
+            if let http = response as? HTTPURLResponse, [400, 422].contains(http.statusCode) { try parameter?.checkRejection(body: body) }
             try HTTP.check(response, data: body); throw QingyiError.message("翻译请求失败。")
         }
-        var stream = TranslationDecoder(contentType: http.value(forHTTPHeaderField: "Content-Type") ?? "")
+        var stream = TranslationDecoder(contentType: http.value(forHTTPHeaderField: "Content-Type") ?? "", fastParameter: parameter)
         var wire = WireLines()
+        var receivedBytes = false
         var lastUpdate = Date.distantPast
         var diagnosticLines = 0
         func acceptLine(_ line: String) throws {
@@ -423,15 +439,20 @@ final class ChatGPT: ObservableObject {
             }
         }
         for try await byte in bytes {
+            receivedBytes = true
             if let line = try wire.append(byte) {
                 try acceptLine(line)
                 if stream.completed { break }
             }
         }
         if !stream.completed, let tail = try wire.finish() { try acceptLine(tail) }
+        try FastTranslationFallbackReason.checkEmptyResponse(http, receivedBytes: receivedBytes)
         let result = try stream.finish()
+        try Task.checkCancellation()
+        guard activeID == client, generation == run else { throw CancellationError() }
         diagnostic?("Decoded response format: \(stream.format.rawValue)")
         onUpdate(result)
+        onThinking(stream.thinkingEvidence)
         return result
     }
     private static func emailKey(_ email: String) -> String? {

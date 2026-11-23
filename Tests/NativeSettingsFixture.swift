@@ -10,9 +10,11 @@ final class NativeSettingsFixture: NSObject, NSApplicationDelegate {
     private var defaults: UserDefaults!
     private var api: APIConfigurationStore!
     private var preferences: Preferences!
+    private var services: BuiltinTranslationSettings!
     private var window: NSWindow!
     private let navigation = SettingsNavigation(section: .services)
     private var subscription: AnyCancellable?
+    private var serviceSubscription: AnyCancellable?
     private var modelFetches = 0
     private let settingsReturn = SystemSettingsReturnCoordinator()
     private var returnEvents: [[String: Any]] = []
@@ -21,6 +23,7 @@ final class NativeSettingsFixture: NSObject, NSApplicationDelegate {
         defaults = UserDefaults(suiteName: domain)!
         api = APIConfigurationStore(defaults: defaults, vault: MemoryAPIKeyVault())
         preferences = Preferences(defaults: defaults)
+        services = BuiltinTranslationSettings(defaults: defaults)
         preferences.trusted = false
         var provider = QingyiTests.fixtureProvider()
         provider.name = "隔离测试 API"
@@ -40,7 +43,7 @@ final class NativeSettingsFixture: NSObject, NSApplicationDelegate {
         window.contentMinSize = NSSize(width: 780, height: 600); window.delegate = navigation
         window.contentView = NSHostingView(rootView: SettingsView(preferences: preferences, chat: chat, api: api,
             navigation: navigation, updateShortcut: { _ in true }, shortcutRecording: { _ in }, preview: {}, verify: {},
-            loadsAccounts: false, apiClient: CustomAPIClient(session: FixtureAPIProtocol.session()),
+            services: services, loadsAccounts: false, apiClient: CustomAPIClient(session: FixtureAPIProtocol.session()),
             requestSystemPermission: { [weak self] in
                 guard let self = self else { return }
                 self.settingsReturn.begin(window: self.window)
@@ -62,6 +65,7 @@ final class NativeSettingsFixture: NSObject, NSApplicationDelegate {
         let menu = NSMenu(); let item = NSMenuItem(); let appMenu = NSMenu()
         appMenu.addItem(withTitle: "退出隔离验证", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.submenu = appMenu; menu.addItem(item); NSApp.mainMenu = menu
+        serviceSubscription = services.objectWillChange.sink { [weak self] _ in DispatchQueue.main.async { self?.record() } }
         subscription = api.$revision.sink { [weak self] _ in DispatchQueue.main.async { self?.record() } }
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         record()
@@ -78,6 +82,8 @@ final class NativeSettingsFixture: NSObject, NSApplicationDelegate {
             "providers": api.providers.map { provider in
                 ["name": provider.name, "models": provider.models.map { ["id": $0.id, "name": $0.name] }] as [String: Any]
             },
+            "serviceOrder": services.order.map(\.rawValue),
+            "enabledServices": ["youdao": services.youdao, "google": services.google, "ai": services.ai],
             "modelFetches": modelFetches, "realCredentials": false, "realNetworkRequests": false,
             "returnEvents": returnEvents
         ]

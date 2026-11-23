@@ -4,23 +4,27 @@ import SwiftUI
 typealias ViewState<Value> = SwiftUI.State<Value>
 
 struct TranslationServiceSettings: View {
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var api: APIConfigurationStore
     @ObservedObject var chat: ChatGPT
+    @ObservedObject var services: BuiltinTranslationSettings = BuiltinTranslationSettings()
     var verify: () -> Void
     var edit: (APIProvider) -> Void
     var manageAccount: () -> Void
     @ViewState<String> private var message = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
-            SettingsGroup(title: "默认翻译") {
+            TranslationServicesListView(store: services)
+            SettingsGroup(title: "AI 翻译") {
                 SettingsRow {
                     Text("翻译服务").fixedSize(); Spacer()
                     Picker("翻译服务", selection: Binding(get: { api.activeProviderID }, set: { id in perform { try api.selectProvider(id) } })) {
+                        Text("未配置").tag(APIConfiguration.unconfiguredProviderID)
                         Text("ChatGPT 账号").tag("")
                         ForEach(api.providers) { Text($0.name).tag($0.id) }
-                        if !api.activeProviderID.isEmpty, api.activeProvider == nil { Text("服务已删除，请重新选择").tag(api.activeProviderID) }
+                        if !api.isUnconfigured, !api.activeProviderID.isEmpty, api.activeProvider == nil { Text("服务已删除，请重新选择").tag(api.activeProviderID) }
                     }.labelsHidden().lineLimit(1).truncationMode(.tail).settingsControlColumn()
-                        .help(api.activeProviderID.isEmpty ? "ChatGPT 账号" : (api.activeProvider?.name ?? "服务已删除，请重新选择"))
+                        .help(api.isUnconfigured ? "请选择 AI 翻译服务" : api.activeProviderID.isEmpty ? "ChatGPT 账号" : (api.activeProvider?.name ?? "服务已删除，请重新选择"))
                         .disabled(chat.busy || !api.loadError.isEmpty)
                 }
                 Divider()
@@ -38,12 +42,16 @@ struct TranslationServiceSettings: View {
                             ForEach(chat.models) { Text($0.name).tag($0.id) }
                         }.labelsHidden().lineLimit(1).truncationMode(.tail).settingsControlColumn()
                             .help(chat.modelName.isEmpty ? "请连接账号并刷新模型" : chat.modelName).disabled(chat.busy || !chat.signedIn)
-                    } else { Text("请重新选择服务").foregroundStyle(.secondary).settingsControlColumn() }
+                    } else { Text(api.isUnconfigured ? "未配置" : "请重新选择服务").foregroundStyle(.secondary).settingsControlColumn() }
+                }
+                if let model = selectedReasoningModel {
+                    Divider()
+                    reasoningSettings(for: model.key, supportsFast: model.supportsFast)
                 }
                 Divider()
                 SettingsRow {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(api.activeProviderID.isEmpty ? "使用当前授权账号的订阅额度" : "使用所选服务商的 API 额度")
+                        Text(api.isUnconfigured ? "选择服务和模型后参与翻译" : api.activeProviderID.isEmpty ? "使用当前授权账号的订阅额度" : "使用所选服务商的 API 额度")
                         Text("验证会发送一句固定英文。").font(.system(size: 11)).foregroundStyle(.secondary)
                     }.fixedSize(horizontal: false, vertical: true)
                     Spacer()
@@ -52,7 +60,8 @@ struct TranslationServiceSettings: View {
                         .disabled(api.activeProviderID.isEmpty ? (!chat.signedIn || chat.modelID.isEmpty || chat.busy) : api.activeProvider?.selectedModel == nil)
                 }
             }
-            Text("应用于新翻译任务。译文窗口中的临时换模型仅影响本次翻译。")
+            .disabled(!services.ai)
+            Text("每次翻译会将原文发送至已开启的内置服务和所选 AI 服务。译文窗口中的临时换模型仅影响本次 AI 译文。")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 9) {
                 HStack {
@@ -90,6 +99,72 @@ struct TranslationServiceSettings: View {
             if !message.isEmpty { Text(message).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
             if !api.loadError.isEmpty { Text(api.loadError).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
         }
+    }
+    private var selectedReasoningModel: (key: ModelReasoningKey, supportsFast: Bool)? {
+        if let provider = api.activeProvider, let model = provider.selectedModel {
+            return (ModelReasoningKey(provider: provider, modelID: model.id),
+                    FastTranslationCapability.supports(provider: provider, model: model))
+        }
+        if api.activeProviderID.isEmpty, !chat.activeID.isEmpty, !chat.modelID.isEmpty {
+            return (ModelReasoningKey(accountID: chat.activeID, modelID: chat.modelID),
+                    FastTranslationCapability.supportsChatGPT(modelID: chat.modelID))
+        }
+        return nil
+    }
+    private func reasoningSettings(for key: ModelReasoningKey, supportsFast: Bool) -> some View {
+        let enabled = api.fastTranslationEnabled(for: key)
+        let status = api.lastThinkingStatus(for: key)
+        let retried = api.lastTranslationUsedDefaultRetry(for: key)
+        return VStack(alignment: .leading, spacing: 9) {
+            if supportsFast {
+                VStack(alignment: .leading, spacing: 3) {
+                    Toggle(isOn: Binding(get: { api.fastTranslationEnabled(for: key) },
+                                         set: { api.setFastTranslation($0, for: key) })) {
+                        Text("快速翻译").font(.system(size: 13)).frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .toggleStyle(.switch).controlSize(.small)
+                    .accessibilityIdentifier("fastTranslation")
+                    if api.hasRememberedFastTranslationRejection(for: key) {
+                        Text("此服务已明确拒绝该模型的快速翻译请求，后续将直接使用默认模式。")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                            .accessibilityIdentifier("fastTranslationRejection")
+                        if enabled {
+                            Button("下次重新尝试快速模式") { api.clearFastTranslationRejection(for: key) }
+                                .buttonStyle(.link).font(.system(size: 11))
+                                .help("清除这条记录，在下一次翻译时重新尝试。")
+                                .accessibilityIdentifier("retryFastTranslationNextTime")
+                        }
+                    } else {
+                        Text(enabled ? "请求关闭思考。若服务明确拒绝，会记住并改用默认模式。若未返回译文，仅本次用默认模式重试。" : "下一次翻译使用服务默认的思考设置。")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                Text("此模型使用服务默认的思考设置。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { thinkingStatusLabel; thinkingStatusValue(status, retried: retried) }.fixedSize()
+                VStack(alignment: .leading, spacing: 3) { thinkingStatusLabel; thinkingStatusValue(status, retried: retried) }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 9).padding(.vertical, 7)
+            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 6))
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("lastTranslationThinkingStatus")
+        }
+        .padding(.horizontal, SettingsLayout.cardInset).padding(.vertical, 11)
+    }
+    private var thinkingStatusLabel: some View {
+        Label("上次翻译的思考状态", systemImage: "clock.arrow.circlepath")
+            .font(.system(size: 11)).foregroundStyle(.secondary)
+    }
+    private func thinkingStatusValue(_ status: TranslationThinkingStatus?, retried: Bool) -> some View {
+        let confirmedColor = colorScheme == .dark ? Color(red: 0.55, green: 0.86, blue: 0.66) : Color(red: 0.13, green: 0.46, blue: 0.29)
+        let prefix = retried ? "已用默认模式重试 · " : ""
+        return Text(prefix + (status?.label ?? "暂无翻译记录"))
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(status == .confirmedOff ? confirmedColor : .primary)
     }
     private var defaultBadge: some View {
         Text("默认服务").font(.system(size: 10)).foregroundStyle(Color.accentColor).fixedSize()

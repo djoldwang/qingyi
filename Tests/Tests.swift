@@ -25,6 +25,13 @@ struct QingyiTests {
     }
     @MainActor static func main() {
         setbuf(stdout, nil)
+        if CommandLine.arguments.contains("--native-service-scroll") || Bundle.main.bundleIdentifier == "com.laowang.qingyi.service-scroll-tests" {
+            let delegate = NativeServiceScrollFixture()
+            NSApplication.shared.setActivationPolicy(.accessory)
+            NSApplication.shared.delegate = delegate
+            withExtendedLifetime(delegate) { NSApplication.shared.run() }
+            return
+        }
         if CommandLine.arguments.contains("--native-screenshot") { runNativeScreenshotFixture(); return }
         if CommandLine.arguments.contains("--native-settings") || Bundle.main.bundleIdentifier == "com.laowang.qingyi.settings-tests" {
             runNativeSettingsFixture(); return
@@ -38,6 +45,13 @@ struct QingyiTests {
         NSApplication.shared.run()
     }
     @MainActor static func runTests() async {
+        if let index = CommandLine.arguments.firstIndex(of: "--builtin-ui-snapshots"), CommandLine.arguments.count > index + 1 {
+            do {
+                let recognized = try await VisionScreenshotOCR().recognize(screenshotImage())
+                try renderBuiltinUI(to: CommandLine.arguments[index + 1], recognized: recognized); print("PASS native service card snapshots") }
+            catch { print("FAIL \(error)"); exit(1) }
+            return
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--ui-snapshots"), CommandLine.arguments.count > index + 1 {
             do { try renderCustomUI(to: CommandLine.arguments[index + 1]); print("PASS UI snapshots rendered with fixture data") }
             catch { print("FAIL UI snapshots: \(error)"); exit(1) }
@@ -56,7 +70,13 @@ struct QingyiTests {
             await screenshotTests()
             print("\(passed) passed, \(failed) failed"); exit(failed == 0 ? 0 : 1)
         }
+        await builtinTranslationTests()
+        await youdaoDirectTests()
+        await youdaoFastTests()
+        await googleNativeTests()
         await customAPITests()
+        await translationThinkingTests()
+        await fastTranslationFallbackTests()
         await temporaryModelTests()
         hoverTests()
         await hoverAppTests()

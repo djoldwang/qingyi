@@ -3,6 +3,39 @@ import Foundation
 
 extension QingyiTests {
     @MainActor static func settingsTests() {
+        check("Keychain completion restores settings only after an observed authorization panel closes") {
+            var state = CredentialWindowReturnState()
+            try expect(state.update(at: 0, foreground: .owner, authorizationVisible: false, accessFinished: false, sourceAvailable: true) == .waiting)
+            try expect(state.update(at: 0.1, foreground: .unknown, authorizationVisible: false, accessFinished: false, sourceAvailable: true) == .waiting)
+            try expect(state.update(at: 1, foreground: .authorization, authorizationVisible: true, accessFinished: false, sourceAvailable: true) == .waiting)
+            try expect(state.update(at: 2, foreground: .other, authorizationVisible: true, accessFinished: true, sourceAvailable: true) == .waiting)
+            try expect(state.update(at: 2.2, foreground: .authorization, authorizationVisible: false, accessFinished: true, sourceAvailable: true) == .restore)
+        }
+        check("Authorized silent reads and deliberate switches before or during Keychain never raise settings") {
+            var state = CredentialWindowReturnState()
+            try expect(state.update(at: 0, foreground: .owner, authorizationVisible: false, accessFinished: true, sourceAvailable: true) == .cancel)
+            state = CredentialWindowReturnState()
+            try expect(state.update(at: 0.1, foreground: .other, authorizationVisible: false, accessFinished: false, sourceAvailable: true) == .cancel)
+            state = CredentialWindowReturnState()
+            _ = state.update(at: 0.2, foreground: .authorization, authorizationVisible: true, accessFinished: false, sourceAvailable: true)
+            _ = state.update(at: 1, foreground: .other, authorizationVisible: true, accessFinished: false, sourceAvailable: true)
+            try expect(state.update(at: 1.4, foreground: .other, authorizationVisible: true, accessFinished: false, sourceAvailable: true) == .cancel)
+        }
+        check("Keychain denial also returns focus and closed or minimized settings cancel restoration") {
+            var state = CredentialWindowReturnState()
+            _ = state.update(at: 0, foreground: .authorization, authorizationVisible: true, accessFinished: false, sourceAvailable: true)
+            try expect(state.update(at: 1, foreground: .other, authorizationVisible: false, accessFinished: true, sourceAvailable: true) == .restore)
+            try expect(state.update(at: 1, foreground: .authorization, authorizationVisible: true, accessFinished: true, sourceAvailable: false) == .cancel)
+        }
+        check("Long Keychain authorization keeps the focus policy and respects a deliberate app switch") {
+            var state = CredentialWindowReturnState()
+            _ = state.update(at: 0, foreground: .authorization, authorizationVisible: true, accessFinished: false, sourceAvailable: true)
+            try expect(state.update(at: 120, foreground: .authorization, authorizationVisible: true, accessFinished: false, sourceAvailable: true) == .waiting)
+            var switched = state
+            try expect(state.update(at: 121, foreground: .authorization, authorizationVisible: false, accessFinished: true, sourceAvailable: true) == .restore)
+            _ = switched.update(at: 120.1, foreground: .other, authorizationVisible: true, accessFinished: false, sourceAvailable: true)
+            try expect(switched.update(at: 120.5, foreground: .other, authorizationVisible: true, accessFinished: false, sourceAvailable: true) == .cancel)
+        }
         check("Automatic address selections create neither entry nor result panel and preserve a pinned translation") {
             _ = NSApplication.shared
             let floating = FloatingController()

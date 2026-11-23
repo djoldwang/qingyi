@@ -100,35 +100,142 @@ struct KeychainAPIKeyVault: APIKeyVault {
 }
 
 struct APIConfiguration: Codable, Equatable {
+    static let unconfiguredProviderID = "__unconfigured__"
     var schemaVersion = 1
     var providers: [APIProvider] = []
-    // Empty means ChatGPT. IDs remain stable when names, addresses or models change.
-    var activeProviderID = ""
+    // Empty remains ChatGPT for existing saved configurations.
+    var activeProviderID = unconfiguredProviderID
+}
+
+struct ModelReasoningKey: Hashable, Codable {
+    private enum Service: Hashable, Codable {
+        case chatGPT(accountID: String)
+        case customAPI(providerID: String, endpoint: String, apiProtocol: APIProtocol)
+    }
+    private let service: Service
+    private let modelID: String
+
+    init(accountID: String, modelID: String) {
+        service = .chatGPT(accountID: accountID)
+        self.modelID = modelID
+    }
+    init(provider: APIProvider, modelID: String) {
+        let url = try? APIEndpoint.base(provider.baseURL)
+        var parts = url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }
+        let host = parts?.host?.lowercased()
+        parts?.host = host
+        if (parts?.scheme == "https" && parts?.port == 443) || (parts?.scheme == "http" && parts?.port == 80) {
+            parts?.port = nil
+        }
+        service = .customAPI(providerID: provider.id, endpoint: parts?.string ?? provider.baseURL, apiProtocol: provider.apiProtocol)
+        self.modelID = modelID
+    }
+}
+
+enum TranslationThinkingStatus: String, Codable {
+    case usedThinking, confirmedOff, requestedOffUnconfirmed, unreported
+
+    var label: String {
+        switch self {
+        case .usedThinking: return "本次使用了思考模式"
+        case .confirmedOff: return "服务已确认关闭思考"
+        case .requestedOffUnconfirmed: return "已请求关闭思考，服务未确认"
+        case .unreported: return "服务未提供思考状态"
+        }
+    }
 }
 
 @MainActor
 final class APIConfigurationStore: ObservableObject {
+    private struct ThinkingRecord: Codable, Equatable {
+        let status: TranslationThinkingStatus
+        let usedDefaultRetry: Bool
+    }
     static let storageKey = "customAPI.configuration"
+    static let fastTranslationStorageKey = "ai.modelFastTranslation.v1"
+    static let fastRejectionsStorageKey = "ai.modelFastTranslationRejections.v1"
+    static let thinkingHistoryStorageKey = "ai.modelThinkingHistory.v2"
     @Published private(set) var configuration = APIConfiguration()
     @Published private(set) var revision = UUID()
     @Published private(set) var loadError = ""
+    @Published private var fastPreferences: [ModelReasoningKey: Bool]
+    @Published private var fastRejections: Set<ModelReasoningKey>
+    @Published private var thinkingHistory: [ModelReasoningKey: ThinkingRecord]
+    private var fastRejectionGenerations: [ModelReasoningKey: UInt64] = [:]
     private let defaults: UserDefaults
     private let vault: APIKeyVault
     private var pendingKeyReads: [String: (UUID, Task<String?, Error>)] = [:]
     init(defaults: UserDefaults = .standard, vault: APIKeyVault = KeychainAPIKeyVault()) {
         self.defaults = defaults; self.vault = vault
+        fastPreferences = defaults.data(forKey: Self.fastTranslationStorageKey).flatMap {
+            try? JSONDecoder().decode([ModelReasoningKey: Bool].self, from: $0)
+        } ?? [:]
+        fastRejections = defaults.data(forKey: Self.fastRejectionsStorageKey).flatMap {
+            try? JSONDecoder().decode(Set<ModelReasoningKey>.self, from: $0)
+        } ?? []
+        if let data = defaults.data(forKey: Self.thinkingHistoryStorageKey),
+           let saved = try? JSONDecoder().decode([ModelReasoningKey: ThinkingRecord].self, from: data) {
+            thinkingHistory = saved
+        } else {
+            let legacy = defaults.data(forKey: "ai.modelThinkingHistory.v1").flatMap {
+                try? JSONDecoder().decode([ModelReasoningKey: TranslationThinkingStatus].self, from: $0)
+            }
+            thinkingHistory = legacy?.mapValues { ThinkingRecord(status: $0, usedDefaultRetry: false) } ?? [:]
+        }
         if let data = defaults.data(forKey: Self.storageKey) {
             do {
                 let saved = try JSONDecoder().decode(APIConfiguration.self, from: data)
                 guard saved.schemaVersion == 1 else { throw QingyiError.message("配置版本较新") }
                 configuration = saved
             } catch { loadError = "自定义 API 配置无法读取，已保留原数据。请恢复有效配置后重试。" }
+        } else {
+            if let registration = defaults.string(forKey: "activeRegistration"), !registration.isEmpty {
+                // Preserve ChatGPT-only users who predate the custom API settings.
+                configuration.activeProviderID = ""
+            }
+            // Record the initial choice so adding an account later cannot turn
+            // a fresh unconfigured selection into a legacy ChatGPT selection.
+            if let data = try? JSONEncoder().encode(configuration) { defaults.set(data, forKey: Self.storageKey) }
         }
     }
     var providers: [APIProvider] { configuration.providers }
+    var isUnconfigured: Bool { activeProviderID == APIConfiguration.unconfiguredProviderID }
     var activeProviderID: String { configuration.activeProviderID }
     var activeProvider: APIProvider? { providers.first { $0.id == activeProviderID } }
+    func fastTranslationEnabled(for key: ModelReasoningKey) -> Bool { fastPreferences[key] ?? true }
+    func setFastTranslation(_ enabled: Bool, for key: ModelReasoningKey) {
+        guard fastTranslationEnabled(for: key) != enabled else { return }
+        fastPreferences[key] = enabled
+        defaults.set(try? JSONEncoder().encode(fastPreferences), forKey: Self.fastTranslationStorageKey)
+    }
+    func hasRememberedFastTranslationRejection(for key: ModelReasoningKey) -> Bool { fastRejections.contains(key) }
+    func fastTranslationRejectionGeneration(for key: ModelReasoningKey) -> UInt64 { fastRejectionGenerations[key] ?? 0 }
+    func rememberFastTranslationRejection(for key: ModelReasoningKey, generation: UInt64) {
+        guard generation == fastTranslationRejectionGeneration(for: key), !fastRejections.contains(key) else { return }
+        fastRejections.insert(key)
+        saveFastRejections()
+    }
+    func clearFastTranslationRejection(for key: ModelReasoningKey) {
+        // A rejection from before the user cleared this record must not restore it.
+        fastRejectionGenerations[key, default: 0] += 1
+        guard fastRejections.contains(key) else { return }
+        fastRejections.remove(key)
+        saveFastRejections()
+    }
+    private func saveFastRejections() {
+        if fastRejections.isEmpty { defaults.removeObject(forKey: Self.fastRejectionsStorageKey) }
+        else { defaults.set(try? JSONEncoder().encode(fastRejections), forKey: Self.fastRejectionsStorageKey) }
+    }
+    func lastThinkingStatus(for key: ModelReasoningKey) -> TranslationThinkingStatus? { thinkingHistory[key]?.status }
+    func lastTranslationUsedDefaultRetry(for key: ModelReasoningKey) -> Bool { thinkingHistory[key]?.usedDefaultRetry == true }
+    func recordThinkingStatus(_ status: TranslationThinkingStatus, for key: ModelReasoningKey, usedDefaultRetry: Bool = false) {
+        let record = ThinkingRecord(status: status, usedDefaultRetry: usedDefaultRetry)
+        guard thinkingHistory[key] != record else { return }
+        thinkingHistory[key] = record
+        defaults.set(try? JSONEncoder().encode(thinkingHistory), forKey: Self.thinkingHistoryStorageKey)
+    }
     var label: String {
+        if isUnconfigured { return "未配置" }
         guard !activeProviderID.isEmpty else { return "ChatGPT" }
         guard let provider = activeProvider else { return "请选择翻译服务" }
         return "\(provider.name) · \(provider.selectedModel?.name ?? "请选择模型")"
@@ -156,10 +263,12 @@ final class APIConfigurationStore: ObservableObject {
         if let existing = pendingKeyReads[id] { pending = existing }
         else {
             let vault = self.vault
+            let focus = CredentialWindowReturnCoordinator.shared.begin()
             pending = (UUID(), Task.detached { try vault.read(id) })
             pendingKeyReads[id] = pending
             Task { @MainActor [weak self] in
                 _ = try? await pending.1.value
+                CredentialWindowReturnCoordinator.shared.end(focus)
                 if self?.pendingKeyReads[id]?.0 == pending.0 { self?.pendingKeyReads.removeValue(forKey: id) }
             }
         }
@@ -192,7 +301,7 @@ final class APIConfigurationStore: ObservableObject {
         try persist(next)
     }
     func selectProvider(_ id: String) throws {
-        guard id.isEmpty || providers.contains(where: { $0.id == id }) else { throw QingyiError.message("请选择有效的翻译服务。") }
+        guard id == APIConfiguration.unconfiguredProviderID || id.isEmpty || providers.contains(where: { $0.id == id }) else { throw QingyiError.message("请选择有效的翻译服务。") }
         var next = configuration; next.activeProviderID = id; try persist(next)
     }
     func selectModel(_ id: String) throws {
@@ -220,8 +329,52 @@ struct CompletionInput {
     static func translation(_ text: String) -> CompletionInput { CompletionInput(instructions: TranslationPrompt.text, content: [.text(text)]) }
 }
 
+enum FastTranslationCapability {
+    // Exact API model IDs. Related models such as GPT-5, Codex and Pro can
+    // have different minimum reasoning efforts from their namesakes.
+    private static let openAI: Set<String> = [
+        "gpt-5.1", "gpt-5.1-2025-11-13", "gpt-5.2", "gpt-5.2-2025-12-11",
+        "gpt-5.4", "gpt-5.4-2026-03-05", "gpt-5.4-mini", "gpt-5.4-mini-2026-03-17",
+        "gpt-5.4-nano", "gpt-5.4-nano-2026-03-17", "gpt-5.5", "gpt-5.5-2026-04-23",
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"
+    ]
+    private static let deepSeek: Set<String> = ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"]
+    private static let anthropic: Set<String> = [
+        "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6",
+        "claude-opus-4-5", "claude-opus-4-5-20251101", "claude-sonnet-4-5", "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5", "claude-haiku-4-5-20251001"
+    ]
+
+    static func supportsChatGPT(modelID: String) -> Bool { openAI.contains(modelID) }
+
+    static func supports(provider: APIProvider, model: APIModel) -> Bool {
+        guard let url = try? APIEndpoint.base(provider.baseURL) else { return false }
+        if deepSeek.contains(model.id) {
+            // Compatible gateways may accept this control without reporting
+            // the effective mode. Only the response can confirm the result.
+            if provider.apiProtocol == .chatCompletions { return true }
+            guard url.host?.lowercased() == "api.deepseek.com", url.port == nil || url.port == 443 else { return false }
+            return provider.apiProtocol == .responses ? url.path == "/v1" : url.path == "/anthropic/v1"
+        }
+        guard url.path == "/v1", url.port == nil || url.port == 443 else { return false }
+        if provider.apiProtocol == .anthropic {
+            return url.host?.lowercased() == "api.anthropic.com" && anthropic.contains(model.id)
+        }
+        return url.host?.lowercased() == "api.openai.com" && supportsChatGPT(modelID: model.id)
+    }
+
+    static func parameter(provider: APIProvider, model: APIModel) -> FastTranslationParameter? {
+        guard supports(provider: provider, model: model) else { return nil }
+        switch provider.apiProtocol {
+        case .responses: return .reasoning
+        case .chatCompletions where openAI.contains(model.id): return .reasoningEffort
+        case .chatCompletions, .anthropic: return .thinking
+        }
+    }
+}
+
 enum APIRequestBuilder {
-    static func request(provider: APIProvider, model: APIModel, key: String, input: CompletionInput) throws -> URLRequest {
+    static func request(provider: APIProvider, model: APIModel, key: String, input: CompletionInput, fastTranslation: Bool = false) throws -> URLRequest {
         var request = try authenticated(provider: provider, path: provider.apiProtocol.endpoint, key: key)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -257,6 +410,9 @@ enum APIRequestBuilder {
         case .anthropic:
             body["system"] = input.instructions; body["messages"] = [["role": "user", "content": content]]
             body["max_tokens"] = model.maximumOutputTokens ?? 8192
+        }
+        if fastTranslation, let parameter = FastTranslationCapability.parameter(provider: provider, model: model) {
+            body[parameter.rawValue] = parameter.value
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         return request
@@ -300,11 +456,19 @@ struct CustomAPIDecoder {
     private var dataLines: [String] = []
     private var eventSize = 0
     private var json = ""
-    private var responseDecoder = TranslationDecoder(contentType: "")
+    private var responseDecoder: TranslationDecoder
+    private let fastParameter: FastTranslationParameter?
+    private var reportedThinking = TranslationThinkingEvidence.unreported
+    var thinkingEvidence: TranslationThinkingEvidence { apiProtocol == .responses ? responseDecoder.thinkingEvidence : reportedThinking }
     private(set) var text = ""
     private var stopped = false
+    private var sawUsageOnlyChunk = false
     private(set) var completed = false
-    init(apiProtocol: APIProtocol) { self.apiProtocol = apiProtocol }
+    init(apiProtocol: APIProtocol, fastParameter: FastTranslationParameter? = nil) {
+        self.apiProtocol = apiProtocol
+        self.fastParameter = fastParameter
+        responseDecoder = TranslationDecoder(contentType: "", fastParameter: fastParameter)
+    }
     mutating func line(_ raw: String) throws -> String? {
         if apiProtocol == .responses {
             let update = try responseDecoder.line(raw)
@@ -335,28 +499,46 @@ struct CustomAPIDecoder {
         guard !dataLines.isEmpty else { return nil }
         let payload = dataLines.joined(separator: "\n"); dataLines.removeAll(keepingCapacity: true)
         if payload == "[DONE]" {
-            guard apiProtocol == .chatCompletions, stopped else { throw QingyiError.message("翻译未完整结束，请重试。") }
+            guard apiProtocol == .chatCompletions,
+                  stopped || (sawUsageOnlyChunk && TextPolicy.clean(text).isEmpty) else { throw QingyiError.message("翻译未完整结束，请重试。") }
             completed = true; return text
         }
         guard let data = payload.data(using: .utf8), let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw QingyiError.message("API 流式响应格式错误。")
         }
-        if object["error"] != nil || object["type"] as? String == "error" { throw QingyiError.message("API 在翻译过程中返回错误，请重试或切换模型。") }
+        if object["error"] != nil || object["type"] as? String == "error" {
+            if TextPolicy.clean(text).isEmpty { try fastParameter?.checkRejection(in: object) }
+            throw QingyiError.message("API 在翻译过程中返回错误，请重试或切换模型。")
+        }
+        reportedThinking.observeMetadata(object)
         if apiProtocol == .chatCompletions {
             guard let choices = object["choices"] as? [[String: Any]] else { return nil }
+            if choices.isEmpty, let usage = object["usage"] as? [String: Any], !usage.isEmpty {
+                sawUsageOnlyChunk = true
+            }
             guard let choice = choices.first(where: { ($0["index"] as? Int ?? 0) == 0 }) else { return nil }
             let delta = choice["delta"] as? [String: Any] ?? [:]
+            observeChatThinking(delta)
             if let refusal = delta["refusal"] as? String, !refusal.isEmpty { throw QingyiError.message("模型拒绝了本次翻译。") }
-            text += Self.contentText(delta["content"])
+            text += try Self.contentText(delta["content"])
             if let reason = choice["finish_reason"] as? String {
                 try checkStop(reason); stopped = true
             }
         } else {
             switch object["type"] as? String {
+            case "message_start":
+                if let message = object["message"] as? [String: Any] { reportedThinking.observeMetadata(message) }
             case "content_block_start":
-                if let block = object["content_block"] as? [String: Any], block["type"] as? String == "text" { text += block["text"] as? String ?? "" }
+                if let block = object["content_block"] as? [String: Any] {
+                    if block["type"] as? String == "refusal" { throw QingyiError.message("模型拒绝了本次翻译。") }
+                    observeAnthropicThinking(block)
+                    if block["type"] as? String == "text" { text += block["text"] as? String ?? "" }
+                }
             case "content_block_delta":
-                if let delta = object["delta"] as? [String: Any], delta["type"] as? String == "text_delta" { text += delta["text"] as? String ?? "" }
+                if let delta = object["delta"] as? [String: Any] {
+                    observeAnthropicThinking(delta)
+                    if delta["type"] as? String == "text_delta" { text += delta["text"] as? String ?? "" }
+                }
             case "message_delta":
                 if let delta = object["delta"] as? [String: Any], let reason = delta["stop_reason"] as? String { try checkStop(reason); stopped = true }
             case "message_stop":
@@ -372,9 +554,28 @@ struct CustomAPIDecoder {
         let valid = apiProtocol == .chatCompletions ? ["stop"] : ["end_turn", "stop_sequence"]
         guard valid.contains(reason) else { throw QingyiError.message("模型未完整完成翻译，可能达到输出上限或拒绝请求；请调整最大输出 token 数或切换模型。") }
     }
-    private static func contentText(_ value: Any?) -> String {
+    private static func contentText(_ value: Any?) throws -> String {
+        guard let value, !(value is NSNull) else { return "" }
         if let text = value as? String { return text }
-        return (value as? [[String: Any]] ?? []).filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined()
+        guard let blocks = value as? [[String: Any]] else { throw QingyiError.message("API 返回的译文格式错误。") }
+        if blocks.contains(where: { $0["type"] as? String == "refusal" }) { throw QingyiError.message("模型拒绝了本次翻译。") }
+        return blocks.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined()
+    }
+    private mutating func observeChatThinking(_ message: [String: Any]) {
+        if TranslationThinkingEvidence.hasText(message["reasoning_content"]) || TranslationThinkingEvidence.hasText(message["reasoning"]) {
+            reportedThinking = .used
+        }
+    }
+    private mutating func observeAnthropicThinking(_ block: [String: Any]) {
+        switch block["type"] as? String {
+        case "thinking", "thinking_delta", "signature_delta":
+            if TranslationThinkingEvidence.hasText(block["thinking"]) || TranslationThinkingEvidence.hasText(block["signature"]) {
+                reportedThinking = .used
+            }
+        case "redacted_thinking":
+            if TranslationThinkingEvidence.hasText(block["data"]) { reportedThinking = .used }
+        default: break
+        }
     }
     mutating func finish() throws -> String {
         if apiProtocol == .responses { return try responseDecoder.finish() }
@@ -383,19 +584,28 @@ struct CustomAPIDecoder {
             // Chat-compatible servers sometimes omit [DONE], but must send finish_reason.
             guard completed || (apiProtocol == .chatCompletions && stopped) else { throw QingyiError.message("翻译连接提前结束，结果不完整，请重试。") }
         } else if format == .json, let data = json.data(using: .utf8), let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            guard object["error"] == nil else { throw QingyiError.message("API 返回错误，请检查模型配置后重试。") }
+            if object["error"] != nil || object["type"] as? String == "error" {
+                try fastParameter?.checkRejection(in: object)
+                throw QingyiError.message("API 返回错误，请检查模型配置后重试。")
+            }
+            reportedThinking.observeMetadata(object)
             if apiProtocol == .chatCompletions {
+                if object["object"] as? String == "chat.completion", let choices = object["choices"] as? [[String: Any]], choices.isEmpty {
+                    throw FastTranslationFallbackReason.emptyTranslation
+                }
                 guard let choice = (object["choices"] as? [[String: Any]])?.first, let reason = choice["finish_reason"] as? String,
                       let message = choice["message"] as? [String: Any] else { throw QingyiError.message("API 未返回完整的 Chat Completions 结果。") }
                 try checkStop(reason)
                 if let refusal = message["refusal"] as? String, !refusal.isEmpty { throw QingyiError.message("模型拒绝了本次翻译。") }
-                text = Self.contentText(message["content"])
+                observeChatThinking(message)
+                text = try Self.contentText(message["content"])
             } else {
                 guard let reason = object["stop_reason"] as? String else { throw QingyiError.message("API 未返回完整的 Anthropic 结果。") }
-                try checkStop(reason); text = Self.contentText(object["content"])
+                for block in object["content"] as? [[String: Any]] ?? [] { observeAnthropicThinking(block) }
+                try checkStop(reason); text = try Self.contentText(object["content"])
             }
         } else { throw QingyiError.message("API 没有返回完整结果。") }
-        guard !TextPolicy.clean(text).isEmpty else { throw QingyiError.message("模型没有返回可用译文，请切换模型后重试。") }
+        guard !TextPolicy.clean(text).isEmpty else { throw FastTranslationFallbackReason.emptyTranslation }
         return text
     }
 }
@@ -446,12 +656,24 @@ final class CustomAPIClient {
         }
         throw QingyiError.message("模型列表页数过多，可手动添加模型。")
     }
-    func complete(provider: APIProvider, model: APIModel, key: String, input: CompletionInput, onUpdate: @escaping @MainActor (String) -> Void) async throws -> String {
+    func complete(provider: APIProvider, model: APIModel, key: String, input: CompletionInput, fastTranslation: Bool = false,
+                  onThinking: @escaping @MainActor (TranslationThinkingEvidence) -> Void = { _ in },
+                  onUpdate: @escaping @MainActor (String) -> Void) async throws -> String {
         try Task.checkCancellation()
-        let request = try APIRequestBuilder.request(provider: provider, model: model, key: key, input: input)
+        let request = try APIRequestBuilder.request(provider: provider, model: model, key: key, input: input, fastTranslation: fastTranslation)
         let (bytes, response) = try await session.bytes(for: request)
+        let parameter = fastTranslation ? FastTranslationCapability.parameter(provider: provider, model: model) : nil
+        if let parameter, let http = response as? HTTPURLResponse, [400, 422].contains(http.statusCode) {
+            var errorBody = Data()
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                errorBody.append(byte)
+                if errorBody.count == 16_384 { break }
+            }
+            try parameter.checkRejection(body: errorBody)
+        }
         try CustomAPIHTTP.check(response)
-        var decoder = CustomAPIDecoder(apiProtocol: provider.apiProtocol)
+        var decoder = CustomAPIDecoder(apiProtocol: provider.apiProtocol, fastParameter: parameter)
         var wire = WireLines(); var size = 0; var lastUpdate = Date.distantPast
         for try await byte in bytes {
             try Task.checkCancellation(); size += 1
@@ -464,8 +686,13 @@ final class CustomAPIClient {
             }
         }
         if !decoder.completed, let tail = try wire.finish() { _ = try decoder.line(tail) }
+        if let http = response as? HTTPURLResponse { try FastTranslationFallbackReason.checkEmptyResponse(http, receivedBytes: size > 0) }
         let result = try decoder.finish()
-        try Task.checkCancellation(); await onUpdate(result); return result
+        try Task.checkCancellation()
+        await onUpdate(result)
+        try Task.checkCancellation()
+        await onThinking(decoder.thinkingEvidence)
+        return result
     }
 }
 
@@ -474,11 +701,13 @@ final class TranslationEngine {
     let chat: ChatGPT
     let configuration: APIConfigurationStore
     let client: CustomAPIClient
+    private var latestThinkingRequest: [ModelReasoningKey: UUID] = [:]
     init(chat: ChatGPT, configuration: APIConfigurationStore, client: CustomAPIClient = CustomAPIClient()) {
         self.chat = chat; self.configuration = configuration; self.client = client
     }
     var label: String { configuration.activeProviderID.isEmpty ? "ChatGPT · \(chat.modelName)" : configuration.label }
     func defaultChoice() throws -> TranslationChoice {
+        guard !configuration.isUnconfigured else { throw QingyiError.message("请在设置中选择 AI 翻译服务和模型。") }
         if configuration.activeProviderID.isEmpty {
             guard !chat.activeID.isEmpty, !chat.modelID.isEmpty else { throw QingyiError.message("请在设置中连接 ChatGPT 并选择模型，或临时选择已配置的 API 模型。") }
             return choice(for: TranslationTarget(service: .chatGPT(chat.activeID), modelID: chat.modelID))
@@ -508,27 +737,89 @@ final class TranslationEngine {
         }
         return groups
     }
-    func translate(_ raw: String, target: TranslationTarget? = nil, onUpdate: @escaping @MainActor (String) -> Void) async throws -> String {
+    func translate(_ raw: String, target: TranslationTarget? = nil, onDefaultRetry: @MainActor () -> Void = {},
+                   onUpdate: @escaping @MainActor (String) -> Void) async throws -> String {
         try Task.checkCancellation()
         let text = try TextPolicy.validate(raw)
         guard configuration.loadError.isEmpty else { throw QingyiError.message(configuration.loadError) }
         let revision = configuration.revision
         let selected = try target ?? defaultChoice().target
+        var receivedTranslation = false
         let guardedUpdate: @MainActor (String) -> Void = { [configuration] value in
-            if configuration.revision == revision { onUpdate(value) }
+            guard !Task.isCancelled, configuration.revision == revision else { return }
+            if !receivedTranslation {
+                guard !TextPolicy.clean(value).isEmpty else { return }
+                receivedTranslation = true
+            }
+            onUpdate(value)
         }
-        if case .chatGPT(let account) = selected.service {
-            let result = try await chat.translate(text, using: selected.modelID, accountID: account, onUpdate: guardedUpdate)
-            guard configuration.revision == revision else { throw CancellationError() }
-            return result
+        let modelKey: ModelReasoningKey
+        let supportsFast: Bool
+        typealias SendTranslation = @MainActor (Bool, @escaping @MainActor (TranslationThinkingEvidence) -> Void) async throws -> String
+        let send: SendTranslation
+        switch selected.service {
+        case .chatGPT(let account):
+            modelKey = ModelReasoningKey(accountID: account, modelID: selected.modelID)
+            supportsFast = FastTranslationCapability.supportsChatGPT(modelID: selected.modelID)
+            send = { [chat] fast, report in
+                try await chat.translate(text, using: selected.modelID, accountID: account,
+                                         fastTranslation: fast, onThinking: report, onUpdate: guardedUpdate)
+            }
+        case .customAPI(let id):
+            guard let provider = configuration.providers.first(where: { $0.id == id }) else { throw QingyiError.message("所选 API 服务已删除，请重新选择模型。") }
+            guard let model = provider.models.first(where: { $0.id == selected.modelID }) else { throw QingyiError.message("所选模型已删除，请重新选择模型。") }
+            modelKey = ModelReasoningKey(provider: provider, modelID: model.id)
+            supportsFast = FastTranslationCapability.supports(provider: provider, model: model)
+            var requestKey: String?
+            send = { [configuration, client] fast, report in
+                let key: String
+                if let requestKey { key = requestKey }
+                else {
+                    key = try await configuration.keyForRequest(id)
+                    requestKey = key
+                }
+                try Task.checkCancellation()
+                guard configuration.revision == revision else { throw CancellationError() }
+                return try await client.complete(provider: provider, model: model, key: key, input: .translation(text),
+                                                 fastTranslation: fast, onThinking: report, onUpdate: guardedUpdate)
+            }
         }
-        guard case .customAPI(let id) = selected.service,
-              let provider = configuration.providers.first(where: { $0.id == id }) else { throw QingyiError.message("所选 API 服务已删除，请重新选择模型。") }
-        guard let model = provider.models.first(where: { $0.id == selected.modelID }) else { throw QingyiError.message("所选模型已删除，请重新选择模型。") }
-        let key = try await configuration.keyForRequest(provider.id)
+        // Capture the selection before the first suspension. A settings change affects the next request.
+        let rejectionGeneration = configuration.fastTranslationRejectionGeneration(for: modelKey)
+        let fast = supportsFast && configuration.fastTranslationEnabled(for: modelKey)
+            && !configuration.hasRememberedFastTranslationRejection(for: modelKey)
+        let requestID = UUID()
+        latestThinkingRequest[modelKey] = requestID
+        defer {
+            if latestThinkingRequest[modelKey] == requestID { latestThinkingRequest.removeValue(forKey: modelKey) }
+        }
+        var evidence = TranslationThinkingEvidence.unreported
+        var usedDefaultRetry = false
+        let result: String
+        do {
+            result = try await send(fast) { evidence = $0 }
+        } catch let reason as FastTranslationFallbackReason where fast && !receivedTranslation {
+            try Task.checkCancellation()
+            guard configuration.revision == revision, latestThinkingRequest[modelKey] == requestID else { throw CancellationError() }
+            if reason == .unsupportedParameter {
+                configuration.rememberFastTranslationRejection(for: modelKey, generation: rejectionGeneration)
+            }
+            usedDefaultRetry = true
+            evidence = .unreported
+            onDefaultRetry()
+            result = try await send(false) { evidence = $0 }
+        }
+        try Task.checkCancellation()
         guard configuration.revision == revision else { throw CancellationError() }
-        let result = try await client.complete(provider: provider, model: model, key: key, input: .translation(text), onUpdate: guardedUpdate)
-        guard configuration.revision == revision else { throw CancellationError() }
+        if latestThinkingRequest[modelKey] == requestID {
+            let status: TranslationThinkingStatus
+            switch evidence {
+            case .used: status = .usedThinking
+            case .confirmedOff: status = .confirmedOff
+            case .unreported: status = fast && !usedDefaultRetry ? .requestedOffUnconfirmed : .unreported
+            }
+            configuration.recordThinkingStatus(status, for: modelKey, usedDefaultRetry: usedDefaultRetry)
+        }
         return result
     }
 }

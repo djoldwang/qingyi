@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Security
 
 final class MemoryChatGPTVault: ChatGPTCredentialVault {
     var credentials: Credentials?
@@ -19,8 +20,38 @@ final class WaitingAPIKeyVault: APIKeyVault {
     func remove(_ id: String) throws { }
 }
 
+final class AuthorizationGate<Value> {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private var count = 0
+    let value: Value
+    init(_ value: Value) { self.value = value }
+    var reads: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func read() throws -> Value {
+        lock.lock(); count += 1; lock.unlock()
+        guard gate.wait(timeout: .now() + 25) == .success else { throw QingyiError.message("Authorization fixture was not released") }
+        return value
+    }
+    func release() { gate.signal() }
+}
+
+final class AuthorizedAPIKeyVault: APIKeyVault {
+    let authorization = AuthorizationGate("fixture")
+    func read(_ id: String) throws -> String? { try authorization.read() }
+    func save(_ key: String, id: String) throws { }
+    func remove(_ id: String) throws { }
+}
+
+final class AuthorizedChatGPTVault: ChatGPTCredentialVault {
+    let authorization = AuthorizationGate(Credentials(access: "fixture-chat-token", refresh: nil, idToken: "",
+        scopes: ["chatgpt.tokens.use.direct"], expiry: Date().addingTimeInterval(3600)))
+    func read(_ id: String) throws -> Credentials? { try authorization.read() }
+    func save(_ credentials: Credentials, id: String) throws { }
+    func remove(_ id: String) throws { }
+}
+
 extension QingyiTests {
-    static func bodyOfRequest(_ request: URLRequest) throws -> [String: Any] {
+    static func dataOfRequest(_ request: URLRequest) throws -> Data {
         var data = request.httpBody ?? Data()
         if data.isEmpty, let stream = request.httpBodyStream {
             stream.open(); defer { stream.close() }
@@ -32,7 +63,11 @@ extension QingyiTests {
                 data.append(contentsOf: buffer.prefix(count))
             }
         }
-        return try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        return data
+    }
+
+    static func bodyOfRequest(_ request: URLRequest) throws -> [String: Any] {
+        try JSONSerialization.jsonObject(with: dataOfRequest(request)) as! [String: Any]
     }
     @MainActor static func temporaryModelTests() async {
         check("Translation window defaults to upper-right and saves its own placement without changing button placement") {
@@ -183,7 +218,7 @@ extension QingyiTests {
                 providers.append(provider)
             }
             try store.selectProvider(providers[0].id)
-            let before = defaults.persistentDomain(forName: domain)! as NSDictionary
+            let before = defaults.persistentDomain(forName: domain)!
             let revision = store.revision
             let engine = TranslationEngine(chat: ChatGPT(defaults: defaults), configuration: store, client: CustomAPIClient(session: network))
             let original = String(repeating: "Translate the complete source. ", count: 70) + "TAIL"
@@ -210,7 +245,10 @@ extension QingyiTests {
                 let target = TranslationTarget(service: .customAPI(provider.id), modelID: "shared")
                 let result = try await engine.translate(original, target: target, onUpdate: { _ in })
                 try expect(result == "译文" && calls == 1)
-                try expect((defaults.persistentDomain(forName: domain)! as NSDictionary).isEqual(before))
+                var after = defaults.persistentDomain(forName: domain)!
+                after.removeValue(forKey: APIConfigurationStore.thinkingHistoryStorageKey)
+                try expect((after as NSDictionary).isEqual(to: before))
+                try expect(store.lastThinkingStatus(for: ModelReasoningKey(provider: provider, modelID: "shared")) == .unreported)
                 try expect(store.revision == revision && store.activeProviderID == providers[0].id)
                 try expect(store.activeProvider?.selectedModelID == "default")
             }
@@ -227,22 +265,94 @@ extension QingyiTests {
             var networkStarted = false
             FixtureAPIProtocol.handle = { _ in networkStarted = true; return (500, "application/json", Data()) }
             let engine = TranslationEngine(chat: ChatGPT(defaults: defaults), configuration: config, client: CustomAPIClient(session: network))
-            let request = Task { @MainActor in try await engine.translate("Hello", onUpdate: { _ in }) }
+            var cancelled = false
+            let request = Task { @MainActor in
+                do { return try await engine.translate("Hello", onUpdate: { _ in }) }
+                catch is CancellationError { cancelled = true; throw CancellationError() }
+            }
+            defer { vault.gate.signal() }
             try await Task.sleep(nanoseconds: 20_000_000)
             request.cancel()
-            vault.gate.signal()
+            try await Task.sleep(nanoseconds: 50_000_000)
+            try expect(cancelled && !networkStarted, "Cancellation must complete before the Keychain read returns")
             do { _ = try await request.value; throw QingyiError.message("Expected cancellation") }
             catch is CancellationError { }
             try expect(!networkStarted)
         }
-        await asyncCheck("A stalled credential read has an actionable deadline and can subsequently complete") {
-            let task = Task<String, Error> { try await Task.sleep(nanoseconds: 50_000_000); return "fixture" }
-            do {
-                _ = try await CredentialWait.value(task, timeout: 1_000_000)
-                throw QingyiError.message("Expected credential deadline")
-            } catch { try expect(error.localizedDescription.contains("钥匙串")) }
-            let completed = try await task.value
-            try expect(completed == "fixture")
+        await asyncCheck("API and ChatGPT translations survive authorization beyond 15 seconds and share reads with cancelled callers") {
+            let domain = "qingyi-long-authorization-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: domain)!
+            let network = FixtureAPIProtocol.session()
+            let apiVault = AuthorizedAPIKeyVault()
+            let chatVault = AuthorizedChatGPTVault()
+            defer {
+                apiVault.authorization.release(); chatVault.authorization.release()
+                defaults.removePersistentDomain(forName: domain); network.invalidateAndCancel(); FixtureAPIProtocol.handle = nil
+            }
+            let account = Registration(id: "fixture-account", subject: "fixture", email: "fixture@example.invalid")
+            defaults.set(try JSONEncoder().encode([account]), forKey: "registrations")
+            defaults.set(account.id, forKey: "activeRegistration")
+            let chat = ChatGPT(defaults: defaults, session: network, vault: chatVault)
+            let configuration = APIConfigurationStore(defaults: defaults, vault: apiVault)
+            let provider = fixtureProvider()
+            try configuration.save(provider, replacementKey: "fixture"); try configuration.selectProvider(provider.id)
+            let engine = TranslationEngine(chat: chat, configuration: configuration, client: CustomAPIClient(session: network))
+            var networkCalls = 0
+            FixtureAPIProtocol.handle = { request in
+                networkCalls += 1
+                if request.url?.path == "/v1/models" {
+                    return (200, "application/json", Data(#"{"models":[{"slug":"fixture-model","display_name":"Fixture","visibility":"list"}]}"#.utf8))
+                }
+                if request.url?.path == "/v1/responses" {
+                    return (200, "application/json", Data(#"{"status":"completed","output":[{"content":[{"type":"output_text","text":"译文"}]}]}"#.utf8))
+                }
+                return (200, "application/json", Data(#"{"choices":[{"message":{"content":"译文"},"finish_reason":"stop"}]}"#.utf8))
+            }
+            var cancelled = false
+            let stale = Task { @MainActor in
+                do { _ = try await configuration.keyForRequest(provider.id) }
+                catch is CancellationError { cancelled = true }
+            }
+            var apiFinished = false; var chatFinished = false
+            let apiRequest = Task { @MainActor in
+                defer { apiFinished = true }
+                return try await engine.translate("Hello", onUpdate: { _ in })
+            }
+            let chatRequest = Task { @MainActor in
+                defer { chatFinished = true }
+                return try await engine.translate("Hello", target: .init(service: .chatGPT(account.id), modelID: "fixture-model"), onUpdate: { _ in })
+            }
+            defer { stale.cancel(); apiRequest.cancel(); chatRequest.cancel() }
+            for _ in 0..<100 where apiVault.authorization.reads == 0 || chatVault.authorization.reads == 0 {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            try expect(apiVault.authorization.reads == 1 && chatVault.authorization.reads == 1)
+            stale.cancel()
+            try await Task.sleep(nanoseconds: 50_000_000)
+            try expect(cancelled && !apiFinished && !chatFinished && networkCalls == 0)
+            // Exercise the former production deadline rather than shortening a
+            // test-only timeout. Both callers must still be waiting afterwards.
+            try await Task.sleep(nanoseconds: 15_200_000_000)
+            try expect(!apiFinished && !chatFinished && networkCalls == 0)
+            apiVault.authorization.release(); chatVault.authorization.release()
+            let apiText = try await apiRequest.value
+            let chatText = try await chatRequest.value
+            try expect(apiText == "译文" && chatText == "译文" && networkCalls == 3)
+            try expect(apiVault.authorization.reads == 1 && chatVault.authorization.reads == 1)
+        }
+        await asyncCheck("Credential denial propagates and a cancelled caller cannot consume a completed credential") {
+            let denied = Task<String, Error> { throw NSError(domain: NSOSStatusErrorDomain, code: Int(errSecAuthFailed)) }
+            do { _ = try await CredentialWait.value(denied); throw QingyiError.message("Expected access denial") }
+            catch let error as NSError { try expect(error.domain == NSOSStatusErrorDomain && error.code == Int(errSecAuthFailed)) }
+            let completed = Task<String, Error> { "fixture" }
+            let cancelled = Task { @MainActor in
+                withUnsafeCurrentTask { $0?.cancel() }
+                return try await CredentialWait.value(completed)
+            }
+            do { _ = try await cancelled.value; throw QingyiError.message("Expected cancellation") }
+            catch is CancellationError { }
+            let value = try await completed.value
+            try expect(value == "fixture")
         }
         await asyncCheck("ChatGPT menu loading and explicit translation preserve saved account and default even when default is not listed") {
             let domain = "qingyi-temp-chat-" + UUID().uuidString
@@ -259,7 +369,7 @@ extension QingyiTests {
             let config = APIConfigurationStore(defaults: defaults, vault: MemoryAPIKeyVault())
             let provider = fixtureProvider(); try config.save(provider, replacementKey: "fixture"); try config.selectProvider(provider.id)
             let engine = TranslationEngine(chat: chat, configuration: config, client: CustomAPIClient(session: network))
-            let before = defaults.persistentDomain(forName: domain)! as NSDictionary
+            let before = defaults.persistentDomain(forName: domain)!
             var requests: [String] = []
             FixtureAPIProtocol.handle = { request in
                 requests.append(request.url!.path)
@@ -279,7 +389,10 @@ extension QingyiTests {
             try expect(translated == "译文" && requests == ["/v1/models", "/v1/responses"])
             try expect(chat.activeID == account.id && chat.modelID == "keep-global-default")
             try expect(config.activeProviderID == provider.id && vault.saves == 0)
-            try expect((defaults.persistentDomain(forName: domain)! as NSDictionary).isEqual(before))
+            var after = defaults.persistentDomain(forName: domain)!
+            after.removeValue(forKey: APIConfigurationStore.thinkingHistoryStorageKey)
+            try expect((after as NSDictionary).isEqual(to: before))
+            try expect(config.lastThinkingStatus(for: ModelReasoningKey(accountID: account.id, modelID: "temporary")) == .unreported)
         }
         await asyncCheck("Temporary request errors and stale targets do not fall back to the global provider") {
             let domain = "qingyi-temp-error-" + UUID().uuidString

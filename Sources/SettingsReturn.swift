@@ -68,6 +68,14 @@ final class SystemSettingsReturnCoordinator {
     // Native test fixtures can record the outcome without changing production UI.
     var onOutcome: ((SystemSettingsReturnState.Outcome) -> Void)?
 
+    func restore(window: NSWindow) {
+        cancel()
+        sourceWindow = window
+        originalAnimationBehavior = window.animationBehavior
+        window.animationBehavior = .none
+        restoreExistingWindow()
+    }
+
     func begin(window: NSWindow) {
         cancel()
         sourceWindow = window
@@ -205,5 +213,135 @@ final class SystemSettingsReturnCoordinator {
         if let window = sourceWindow, let animation = originalAnimationBehavior {
             DispatchQueue.main.async { [weak window] in window?.animationBehavior = animation }
         }
+    }
+}
+
+// Observe only a credential operation begun while our settings were active.
+// Completing an ordinary, already-authorized read must never activate the app.
+struct CredentialWindowReturnState {
+    enum Foreground { case owner, authorization, other, unknown }
+    enum Outcome { case waiting, restore, cancel }
+    private(set) var sawAuthorization = false
+    private var otherApplicationSince: TimeInterval?
+
+    mutating func update(at time: TimeInterval, foreground: Foreground, authorizationVisible: Bool,
+                         accessFinished: Bool, sourceAvailable: Bool) -> Outcome {
+        guard sourceAvailable else { return .cancel }
+        if foreground == .authorization || authorizationVisible { sawAuthorization = true }
+        if foreground == .other {
+            guard sawAuthorization else { return .cancel }
+            if !accessFinished {
+                if otherApplicationSince == nil { otherApplicationSince = time }
+                if time - otherApplicationSince! >= 0.35 { return .cancel }
+            }
+        } else { otherApplicationSince = nil }
+        guard accessFinished else { return .waiting }
+        guard sawAuthorization else { return .cancel }
+        return authorizationVisible ? .waiting : .restore
+    }
+}
+
+@MainActor
+final class CredentialWindowReturnCoordinator {
+    static let shared = CredentialWindowReturnCoordinator()
+    private weak var window: NSWindow?
+    private var reads: Set<UUID> = []
+    private var state = CredentialWindowReturnState()
+    private var timer: Timer?
+    private var observers: [(NotificationCenter, NSObjectProtocol)] = []
+    private let windowReturn = SystemSettingsReturnCoordinator()
+    private var finishedAt: TimeInterval?
+    var onOutcome: ((CredentialWindowReturnState.Outcome) -> Void)?
+    // Supplied by isolated native fixtures to represent their authorization app.
+    var authorizationApplication: (NSRunningApplication) -> Bool = { app in
+        let identifier = app.bundleIdentifier ?? ""
+        return identifier == "com.apple.SecurityAgent" || identifier.hasPrefix("com.apple.SecurityAgentHelper.")
+            || identifier == "com.apple.CoreAuthUI"
+    }
+
+    func setSourceWindow(_ window: NSWindow) { self.window = window }
+
+    func begin() -> UUID? {
+        guard let window, window.isVisible, !window.isMiniaturized, window.isOnActiveSpace else { return nil }
+        if timer == nil {
+            guard NSApp.isActive else { return nil }
+            state = CredentialWindowReturnState()
+            finishedAt = nil
+            windowReturn.cancel()
+            let workspace = NSWorkspace.shared.notificationCenter
+            watch(workspace, NSWorkspace.didActivateApplicationNotification) { [weak self] in self?.sample() }
+            watch(workspace, NSWorkspace.activeSpaceDidChangeNotification) { [weak self] in self?.cancel() }
+            watch(.default, NSWindow.willCloseNotification, object: window) { [weak self] in self?.cancel() }
+            watch(.default, NSWindow.didMiniaturizeNotification, object: window) { [weak self] in self?.cancel() }
+            let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.sample() }
+            }
+            self.timer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+        let id = UUID()
+        reads.insert(id)
+        return id
+    }
+
+    func end(_ id: UUID?) {
+        guard let id, reads.remove(id) != nil else { return }
+        if reads.isEmpty { finishedAt = ProcessInfo.processInfo.systemUptime }
+        sample()
+    }
+
+    func cancel() {
+        stop()
+        windowReturn.cancel()
+    }
+
+    private func stop() {
+        timer?.invalidate(); timer = nil
+        for (center, observer) in observers { center.removeObserver(observer) }
+        observers.removeAll()
+        reads.removeAll()
+        finishedAt = nil
+    }
+
+    private func watch(_ center: NotificationCenter, _ name: Notification.Name, object: Any? = nil,
+                       action: @escaping @MainActor () -> Void) {
+        let observer = center.addObserver(forName: name, object: object, queue: .main) { _ in
+            MainActor.assumeIsolated { action() }
+        }
+        observers.append((center, observer))
+    }
+
+    private func sample() {
+        guard timer != nil else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let prompts = NSWorkspace.shared.runningApplications.filter(authorizationApplication)
+        let promptPIDs = Set(prompts.map(\.processIdentifier))
+        let foreground = NSWorkspace.shared.frontmostApplication
+        let owner = foreground?.processIdentifier == getpid()
+        let authorization = foreground.map(authorizationApplication) == true
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        let visible = windows?.contains {
+            guard let pid = $0[kCGWindowOwnerPID as String] as? Int32, promptPIDs.contains(pid),
+                  let bounds = $0[kCGWindowBounds as String] as? [String: Any],
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return false }
+            return rect.width > 80 && rect.height > 40 && ($0[kCGWindowAlpha as String] as? Double ?? 1) > 0
+        } == true
+        let sourceAvailable = window?.isVisible == true && window?.isMiniaturized == false && window?.isOnActiveSpace == true
+        let current: CredentialWindowReturnState.Foreground
+        if foreground == nil { current = .unknown }
+        else if owner { current = .owner }
+        else if authorization { current = .authorization }
+        else { current = .other }
+        let outcome = state.update(at: now, foreground: current,
+            authorizationVisible: visible, accessFinished: reads.isEmpty, sourceAvailable: sourceAvailable)
+        // Give a dismissed system panel time to leave WindowServer. A timeout
+        // abandons restoration instead of activating while a panel still exists.
+        if outcome == .waiting, let finishedAt, now - finishedAt >= 2 {
+            cancel(); onOutcome?(.cancel); return
+        }
+        guard outcome != .waiting else { return }
+        stop()
+        if outcome == .restore, let window { windowReturn.restore(window: window) }
+        onOutcome?(outcome)
     }
 }

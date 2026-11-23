@@ -7,6 +7,9 @@ import ApplicationServices
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let chat = ChatGPT()
     let api = APIConfigurationStore()
+    var services = BuiltinTranslationSettings()
+    var builtinClient = BuiltinTranslationClient()
+    private var serviceTasks: [TranslationServiceID: Task<Void, Never>] = [:]
     private lazy var engine = TranslationEngine(chat: chat, configuration: api)
     let preferences = Preferences()
     let floating = FloatingController()
@@ -33,7 +36,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var selection: SelectionSnapshot?
     private var fingerprint = ""
     private var triggered = false
-    private var translation: Task<Void, Never>?
     private var translationSession: TranslationSession?
     private var modelLoadingTask: Task<Void, Never>?
     private var permissionTimer: Timer?
@@ -75,8 +77,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu(); menu.delegate = self; statusItem.menu = menu
         floating.onTrigger = { [weak self] in self?.trigger() }
         floating.onClose = { [weak self] in self?.dismiss() }
+        floating.onRetryService = { [weak self] id in self?.performTranslation(keepPosition: true, only: id) }
         floating.onRetry = { [weak self] in self?.retryTranslation() }
-        floating.onSettings = { [weak self] in self?.dismiss(); self?.showSettings() }
+        floating.onSettings = { [weak self] in self?.presentSettings(.services) }
         floating.onModelMenuTracking = { [weak self] tracking in
             guard let self = self else { return }
             if tracking { self.floating.state.modelGroups = self.engine.modelGroups() }
@@ -85,12 +88,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         floating.onSelectModel = { [weak self] choice, id in
             guard let self = self, self.translationSession?.id == id,
                   self.translationSession?.select(choice) == true else { return }
-            self.performTranslation(keepPosition: true)
+            self.performTranslation(keepPosition: true, only: .ai)
         }
         floating.onRestoreModel = { [weak self] id in
             guard let self = self, self.translationSession?.id == id,
                   self.translationSession?.restoreDefault() == true else { return }
-            self.performTranslation(keepPosition: true)
+            self.performTranslation(keepPosition: true, only: .ai)
         }
         floating.onLoadModels = { [weak self] id in self?.loadTemporaryModels(sessionID: id) }
         monitor.onSelection = { [weak self] in self?.selectionChanged($0) }
@@ -142,6 +145,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.monitor.enabled = !value
             self?.statusItem?.button?.appearsDisabled = value
             if value, self?.screenshotID == nil, self?.floating.state.pinned == false { self?.dismiss() }
+            if value { self?.builtinClient.cancelYoudaoPreparation() }
+            else if self?.services.youdao == true { self?.builtinClient.prepareYoudaoConnection() }
         }.store(in: &subscriptions)
         chat.$activeID.dropFirst().sink { [weak self] _ in self?.dismiss() }.store(in: &subscriptions)
         var previouslySignedIn = chat.signedIn
@@ -155,6 +160,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             previousModelID = id
         }.store(in: &subscriptions)
         api.$revision.dropFirst().sink { [weak self] _ in self?.dismiss() }.store(in: &subscriptions)
+        observeServiceSwitches()
+        observeServicesOrder()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             MainActor.assumeIsolated {
@@ -174,8 +181,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showSettings(); return true }
     func applicationWillTerminate(_ notification: Notification) {
-        settingsReturn.cancel(); cancelScreenshot(restore: false)
-        permissionTimer?.invalidate(); chat.cancelLogin(); translation?.cancel(); modelLoadingTask?.cancel(); hover.cancel(); monitor.stop()
+        builtinClient.cancelYoudaoPreparation()
+        settingsReturn.cancel(); CredentialWindowReturnCoordinator.shared.cancel(); cancelScreenshot(restore: false)
+        permissionTimer?.invalidate(); cancelServiceTasks(); chat.cancelLogin(); modelLoadingTask?.cancel(); hover.cancel(); monitor.stop()
     }
     private func configureMainMenu() {
         let menu = NSMenu()
@@ -228,10 +236,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window.title = "轻译设置"; window.isReleasedWhenClosed = false; window.contentMinSize = NSSize(width: 780, height: 600)
             window.hidesOnDeactivate = false
             window.delegate = settingsNavigation
-            window.contentView = NSHostingView(rootView: SettingsView(preferences: preferences, chat: chat, api: api, navigation: settingsNavigation, updateShortcut: { [weak self] binding in self?.applyShortcut(binding) ?? false }, shortcutRecording: { [weak self] recording in self?.setShortcutRecording(recording) }, preview: { [weak self] in self?.showPreview() }, verify: { [weak self] in self?.verifyTranslation() }, requestSystemPermission: { [weak self] in self?.openSystemPermissions() }, updateScreenshotShortcut: { [weak self] in self?.applyScreenshotShortcut($0) ?? false }, requestScreenCapturePermission: { [weak self] in self?.manageScreenCapturePermission() }))
+            window.contentView = NSHostingView(rootView: SettingsView(preferences: preferences, chat: chat, api: api, navigation: settingsNavigation, updateShortcut: { [weak self] binding in self?.applyShortcut(binding) ?? false }, shortcutRecording: { [weak self] recording in self?.setShortcutRecording(recording) }, preview: { [weak self] in self?.showPreview() }, verify: { [weak self] in self?.verifyTranslation() }, services: services, requestSystemPermission: { [weak self] in self?.openSystemPermissions() }, updateScreenshotShortcut: { [weak self] in self?.applyScreenshotShortcut($0) ?? false }, requestScreenCapturePermission: { [weak self] in self?.manageScreenCapturePermission() }))
             window.center(); settingsWindow = window
         }
         settingsNavigation.open(section)
+        if let settingsWindow { CredentialWindowReturnCoordinator.shared.setSourceWindow(settingsWindow) }
         NSApp.activate(ignoringOtherApps: true); settingsWindow?.makeKeyAndOrderFront(nil)
         if api.activeProviderID.isEmpty, chat.signedIn, chat.models.isEmpty { Task { await chat.refreshModels() } }
     }
@@ -372,7 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             catch {
                 guard self.screenshotID == id, !Task.isCancelled else { return }
                 self.screenshotTask = nil; self.screenshotWasVisible = false
-                self.translationSession = nil; self.translation?.cancel(); self.translation = nil
+                self.translationSession = nil; self.cancelServiceTasks()
                 self.modelLoadingTask?.cancel(); self.modelLoadingTask = nil
                 self.hoverSessionActive = false; self.hoverContext = nil
                 if !keepPosition { self.floating.hide() }
@@ -461,7 +470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .failure(let error):
                     HoverDiagnostics.log("read failed: \(error.localizedDescription)")
                     if error is CancellationError { return }
-                    self.translationSession = nil; self.translation?.cancel()
+                    self.translationSession = nil; self.cancelServiceTasks()
                     self.modelLoadingTask?.cancel(); self.modelLoadingTask = nil
                     self.hoverContext = (pid, point); self.hoverSessionActive = true
                     self.floating.showResult(source: "悬停翻译", position: self.preferences.translationWindowPosition)
@@ -486,40 +495,113 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cancelScreenshot(restore: false)
         hoverTicket?.cancel(); hoverTicket = nil; hoverSessionActive = fromHover
         if !fromHover { hoverContext = nil }
-        translation?.cancel(); modelLoadingTask?.cancel(); modelLoadingTask = nil
-        let initial = try? engine.defaultChoice()
+        cancelServiceTasks(); modelLoadingTask?.cancel(); modelLoadingTask = nil
+        let initial = services.ai ? (try? engine.defaultChoice()) : nil
         translationSession = TranslationSession(source: source, defaultChoice: initial)
         floating.state.loadingChatGPTModels = false; floating.state.modelMenuMessage = ""
+        floating.state.services = services.order.filter { services.enabled($0) && ($0 != .ai || initial != nil) }.map { ServiceTranslationResult(id: $0) }
         performTranslation(keepPosition: keepPosition)
     }
-    private func performTranslation(keepPosition: Bool) {
-        guard translationSession != nil else { return }
-        translation?.cancel(); translationSession?.restart()
-        let context = translationSession!
-        floating.showResult(source: String(context.source.prefix(600)), keepPosition: keepPosition, position: preferences.translationWindowPosition)
-        floating.state.sessionID = context.id
-        floating.state.choice = context.choice.map { engine.choice(for: $0.target) }; floating.state.defaultChoice = context.defaultChoice
-        floating.state.temporaryModel = context.temporary; floating.state.modelSelectionEnabled = true
-        floating.state.modelGroups = engine.modelGroups()
-        floating.state.status = "正在翻译"
-        translation = Task { [self] in
-            do {
-                guard let choice = context.choice else { _ = try engine.defaultChoice(); throw QingyiError.message("请选择翻译模型。") }
-                let result = try await engine.translate(context.source, target: choice.target) { [weak self] text in
-                    guard let self = self, self.translationSession?.accepts(sessionID: context.id, runID: context.runID) == true else { return }
-                    self.floating.state.text = text
+    private func cancelServiceTasks() {
+        serviceTasks.values.forEach { $0.cancel() }; serviceTasks.removeAll()
+    }
+    private func observeServicesOrder() {
+        services.$order.dropFirst().sink { [weak self] order in
+            guard let self else { return }
+            let results = self.floating.state.services
+            self.floating.state.services = order.compactMap { id in results.first { $0.id == id } }
+        }.store(in: &subscriptions)
+    }
+    private func observeServiceSwitches() {
+        let switches: [(TranslationServiceID, Published<Bool>.Publisher)] = [
+            (.youdao, services.$youdao), (.google, services.$google), (.ai, services.$ai)
+        ]
+        for (id, enabled) in switches {
+            enabled.dropFirst().sink { [weak self] isOn in
+                guard let self else { return }
+                if id == .youdao {
+                    if isOn, !self.preferences.paused { self.builtinClient.prepareYoudaoConnection() }
+                    else { self.builtinClient.cancelYoudaoPreparation() }
                 }
-                guard translationSession?.accepts(sessionID: context.id, runID: context.runID) == true else { return }
-                floating.state.choice = engine.choice(for: choice.target)
-                floating.state.text = result; floating.state.loading = false; floating.state.complete = true
-                floating.state.status = "已完成"
-            } catch is CancellationError { }
-            catch {
-                guard translationSession?.accepts(sessionID: context.id, runID: context.runID) == true else { return }
-                floating.state.text = readableError(error); floating.state.loading = false; floating.state.error = true; floating.state.complete = false
-                floating.state.status = "翻译未完成"
+                guard !isOn else { return }
+                self.serviceTasks.removeValue(forKey: id)?.cancel()
+                guard self.floating.state.services.contains(where: { $0.id == id }) else { return }
+                if id == .ai { ModelMenuButton.cancelPresentedMenu() }
+                self.floating.state.services.removeAll { $0.id == id }
+                if self.floating.state.services.isEmpty { self.dismiss() }
+                else { self.updateAggregateState() }
+            }.store(in: &subscriptions)
+        }
+    }
+    private func performTranslation(keepPosition: Bool, only service: TranslationServiceID? = nil) {
+        if let service, !services.enabled(service) { return }
+        guard let context = translationSession else { return }
+        if service == nil {
+            cancelServiceTasks()
+            let cards = floating.state.services
+            floating.showResult(source: String(context.source.prefix(600)), keepPosition: keepPosition, position: preferences.translationWindowPosition)
+            floating.state.services = cards
+        }
+        floating.state.sessionID = context.id
+        floating.state.choice = context.choice.map { engine.choice(for: $0.target) }
+        floating.state.defaultChoice = context.defaultChoice
+        floating.state.temporaryModel = context.temporary
+        floating.state.modelSelectionEnabled = true
+        floating.state.modelGroups = engine.modelGroups()
+        if floating.state.services.isEmpty {
+            floating.state.text = "请在设置中开启有道、谷歌翻译，或配置 AI 服务。"
+            floating.state.loading = false; floating.state.error = true
+            floating.state.status = "尚未启用翻译服务"
+            return
+        }
+        let requested = service.map { [$0] } ?? floating.state.services.map(\.id)
+        for id in requested {
+            guard let index = floating.state.services.firstIndex(where: { $0.id == id }) else { continue }
+            serviceTasks[id]?.cancel()
+            let pending = ServiceTranslationResult(id: id)
+            floating.state.services[index] = pending
+            let runID = pending.runID
+            serviceTasks[id] = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let result: BuiltinTranslationResult
+                    if id == .ai {
+                        guard let choice = context.choice else { throw QingyiError.message("请选择 AI 翻译模型。") }
+                        let text = try await engine.translate(context.source, target: choice.target, onDefaultRetry: { [weak self] in
+                            self?.updateService(id, sessionID: context.id, runID: runID) { $0.retryingWithDefault = true }
+                        }) { [weak self] text in
+                            self?.updateService(id, sessionID: context.id, runID: runID) { $0.result.text = text }
+                        }
+                        result = BuiltinTranslationResult(text: text)
+                    } else {
+                        result = try await builtinClient.translate(context.source, service: id) { [weak self] text in
+                            self?.updateService(id, sessionID: context.id, runID: runID) { $0.result.text = text }
+                        }
+                    }
+                    try Task.checkCancellation()
+                    updateService(id, sessionID: context.id, runID: runID) { $0.result = result; $0.loading = false }
+                } catch is CancellationError { }
+                catch {
+                    guard !Task.isCancelled else { return }
+                    updateService(id, sessionID: context.id, runID: runID) { $0.error = self.readableError(error); $0.loading = false }
+                }
             }
         }
+        updateAggregateState()
+    }
+    private func updateService(_ id: TranslationServiceID, sessionID: UUID, runID: UUID, update: (inout ServiceTranslationResult) -> Void) {
+        guard translationSession?.id == sessionID,
+              let index = floating.state.services.firstIndex(where: { $0.id == id && $0.runID == runID }) else { return }
+        var result = floating.state.services[index]; update(&result); floating.state.services[index] = result
+        updateAggregateState()
+    }
+    private func updateAggregateState() {
+        let results = floating.state.services
+        floating.state.loading = results.contains { $0.loading }
+        floating.state.complete = !floating.state.loading && results.contains { $0.error == nil }
+        floating.state.error = !floating.state.loading && results.allSatisfy { $0.error != nil }
+        floating.state.text = results.first(where: { $0.id == .ai })?.result.text ?? results.first(where: { $0.error == nil })?.result.copyText ?? ""
+        floating.state.status = floating.state.loading ? "正在翻译" : floating.state.error ? "翻译未完成" : results.contains(where: { $0.error != nil }) ? "部分完成" : "已完成"
     }
     private func loadTemporaryModels(sessionID: UUID) {
         guard translationSession?.id == sessionID, modelLoadingTask == nil else { return }
@@ -553,7 +635,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func dismiss() {
         cancelScreenshot(restore: false)
         hoverTicket?.cancel(); hoverTicket = nil; hoverSessionActive = false; hoverContext = nil
-        translationSession = nil; translation?.cancel(); translation = nil
+        translationSession = nil; cancelServiceTasks()
         modelLoadingTask?.cancel(); modelLoadingTask = nil; floating.hide()
     }
     @objc func showPreview() {
@@ -567,13 +649,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     #if QINGYI_TESTING
     func prepareScreenshotFixture(engine: TranslationEngine, capture: ScreenshotCapturing, ocr: ScreenshotRecognizing) {
+        services = BuiltinTranslationSettings(defaults: UserDefaults(suiteName: "qingyi-fixture-services")!, enabledByDefault: false)
         self.engine = engine; screenshotCapture = capture; screenshotOCR = ocr; screenCaptureAccess = { true }
         floating.onRetry = { [weak self] in self?.retryTranslation() }
         floating.onClose = { [weak self] in self?.dismiss() }
     }
+    func prepareBuiltinFixture(engine: TranslationEngine, client: BuiltinTranslationClient, settings: BuiltinTranslationSettings) {
+        self.engine = engine; builtinClient = client; services = settings
+        observeServiceSwitches()
+        observeServicesOrder()
+    }
+    func retryBuiltinFixture(_ id: TranslationServiceID) { performTranslation(keepPosition: true, only: id) }
     func screenshotClipboardFixture(_ text: String) { startTranslation(text) }
     var screenshotActiveFixture: Bool { screenshotID != nil }
     func prepareHoverFixture(engine: TranslationEngine) {
+        services = BuiltinTranslationSettings(defaults: UserDefaults(suiteName: "qingyi-fixture-services")!, enabledByDefault: false)
         self.engine = engine
         floating.onRetry = { [weak self] in self?.retryTranslation() }
         monitor.onSelection = { [weak self] in self?.selectionChanged($0) }
@@ -618,6 +708,24 @@ if CommandLine.arguments.contains("--api-credential-check") {
 
 // Release smoke test: real requests use disposable preference copies so that
 // checking another account/provider never changes the user's global defaults.
+if CommandLine.arguments.contains("--builtin-translation-check") {
+    Task { @MainActor in
+        let client = BuiltinTranslationClient()
+        var failed = 0
+        for service in [TranslationServiceID.youdao, .google] {
+            for sample in ["resilience", "Small steps make complex things easier to understand."] {
+                do {
+                    let result = try await client.translate(sample, service: service)
+                    print("PASS \(service.name) · \(sample): \(result.copyText)")
+                } catch { failed += 1; print("FAIL \(service.name): \(error.localizedDescription)") }
+            }
+        }
+        exit(failed == 0 ? 0 : 1)
+    }
+    NSApplication.shared.setActivationPolicy(.accessory)
+    NSApplication.shared.run()
+}
+
 if CommandLine.arguments.contains("--services-translation-check") {
     Task { @MainActor in
         do {

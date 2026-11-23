@@ -14,9 +14,10 @@ mkdir -p "$qingyi_cache" "$qingyi_app/Contents/MacOS" "$qingyi_app/Contents/Reso
 xcrun swiftc -swift-version 5 -O -target arm64-apple-macos14.0 -module-cache-path "$qingyi_cache" \
   "$qingyi_root"/Sources/*.swift -o "$qingyi_app/Contents/MacOS/Qingyi" \
   -framework AppKit -framework SwiftUI -framework ApplicationServices -framework Carbon \
-  -framework Security -framework CryptoKit -framework Network -framework NaturalLanguage -framework ServiceManagement -framework Vision
+  -framework WebKit -framework Security -framework CryptoKit -framework Network -framework NaturalLanguage -framework ServiceManagement -framework Vision
 cp "$qingyi_root/Resources/Info.plist" "$qingyi_app/Contents/Info.plist"
 if [ -f "$qingyi_root/Resources/AppIcon.icns" ]; then cp "$qingyi_root/Resources/AppIcon.icns" "$qingyi_app/Contents/Resources/AppIcon.icns"; fi
+cp "$qingyi_root/LICENSE" "$qingyi_root/THIRD_PARTY_NOTICES.md" "$qingyi_app/Contents/Resources/"
 # Sign on a local temporary volume: File Provider adds incompatible FinderInfo in Documents.
 codesign --force --sign "$qingyi_identity" --keychain "$qingyi_keychain" \
   --timestamp=none --identifier com.laowang.qingyi \
