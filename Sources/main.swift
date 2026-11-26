@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var builtinClient = BuiltinTranslationClient()
     private var serviceTasks: [TranslationServiceID: Task<Void, Never>] = [:]
     private lazy var engine = TranslationEngine(chat: chat, configuration: api)
-    let preferences = Preferences()
+    let preferences: Preferences
     let floating = FloatingController()
     let monitor = SelectionMonitor()
     let shortcut = GlobalShortcut()
@@ -25,12 +25,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var screenshotWasVisible = false
     private var screenshotCapturing = false
     let hover = HoverMonitor()
+    let actionPopup = AIActionPopup()
+    private var actionGesture = AIActionGesture()
+    private var actionOwnsModifier = false
+    private var toolbarReadID: UUID?
     private let hoverReadQueue = DispatchQueue(label: "com.laowang.qingyi.hover", qos: .userInitiated)
     private var hoverTicket: HoverReadTicket?
     private var hoverSessionActive = false
     private var hoverContext: (pid: pid_t, point: CGPoint)?
     private var statusItem: NSStatusItem!
     private var settingsWindow: NSWindow?
+    private var settingsAccountActivation: AnyCancellable?
     private let settingsNavigation = SettingsNavigation()
     private let settingsReturn = SystemSettingsReturnCoordinator()
     private var selection: SelectionSnapshot?
@@ -41,6 +46,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var permissionTimer: Timer?
     private var subscriptions = Set<AnyCancellable>()
     private var excludedCandidate: (String, String)?
+
+    init(preferences: Preferences? = nil) {
+        self.preferences = preferences ?? Preferences()
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -86,53 +96,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.monitor.setModelMenuTracking(tracking)
         }
         floating.onSelectModel = { [weak self] choice, id in
-            guard let self = self, self.translationSession?.id == id,
-                  self.translationSession?.select(choice) == true else { return }
-            self.performTranslation(keepPosition: true, only: .ai)
+            self?.selectTemporaryModel(choice, sessionID: id)
         }
         floating.onRestoreModel = { [weak self] id in
-            guard let self = self, self.translationSession?.id == id,
-                  self.translationSession?.restoreDefault() == true else { return }
-            self.performTranslation(keepPosition: true, only: .ai)
+            self?.restoreTemporaryModel(sessionID: id)
         }
         floating.onLoadModels = { [weak self] id in self?.loadTemporaryModels(sessionID: id) }
-        monitor.onSelection = { [weak self] in self?.selectionChanged($0) }
-        monitor.onExternalEvent = { [weak self] in self?.hover.event($0) ?? false }
+        configureSelectionDismissal()
+        configureActionInteraction()
         monitor.onInternalEvent = { [weak self] in self?.hover.cancel() }
-        monitor.onContextChanged = { [weak self] in
-            guard let self = self else { return }
-            guard !self.screenshotCapturing, !self.monitor.screenshotAwaitingFreshInput else { return }
-            self.hover.cancel()
-            if self.hoverSessionActive, !self.floating.state.pinned,
-               NSWorkspace.shared.frontmostApplication?.processIdentifier != getpid() { self.dismiss() }
-        }
         hover.onCancelRead = { [weak self] in self?.hoverTicket?.cancel(); self?.hoverTicket = nil }
         hover.permitsTrigger = { [weak self] point in
-            guard let self = self, self.screenshotID == nil, self.preferences.hoverEnabled, self.preferences.trusted,
+            guard let self = self, self.screenshotID == nil, self.preferences.hoverEnabled, self.engine.textSettings.translationEnabled, self.preferences.trusted,
                   !self.monitor.modelMenuTracking, self.monitor.isInternalInteraction?(point) != true,
                   let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return false }
             return !self.preferences.excluded.contains(app.bundleIdentifier ?? "")
         }
         hover.onTrigger = { [weak self] point in self?.translateHoveredParagraph(at: point) }
-        preferences.$hoverEnabled.combineLatest(preferences.$hoverTrigger).sink { [weak self] enabled, trigger in
-            self?.hover.configure(enabled: enabled, trigger: trigger)
+        preferences.$hoverEnabled.combineLatest(preferences.$hoverTrigger, preferences.$hoverActivation).sink { [weak self] enabled, trigger, activation in
+            self?.hover.configure(enabled: enabled, trigger: trigger, activation: activation)
         }.store(in: &subscriptions)
-        preferences.$excluded.dropFirst().sink { [weak self] _ in self?.hover.cancel() }.store(in: &subscriptions)
         monitor.isInternalInteraction = { [weak self] point in
             guard let self = self else { return false }
             // Hit-test the frontmost window rather than its frame: a settings
             // window behind another app must not suppress that app's selections.
             let number = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
-            let windows: [NSWindow?] = [self.floating.buttonPanel, self.floating.resultPanel, self.settingsWindow]
+            let windows: [NSWindow?] = [self.floating.buttonPanel, self.floating.resultPanel, self.actionPopup.panel, self.settingsWindow]
             return windows.contains { $0?.isVisible == true && $0?.windowNumber == number }
         }
-        monitor.onOutsideClick = { [weak self] point in
-            guard let self = self else { return }
-            if !self.screenshotCapturing, !self.floating.state.pinned, !self.floating.contains(point) { self.dismiss() }
+        monitor.onMenuCancel = { [weak self] in
+            self?.closeActionPopup()
+            FloatingController.cancelResultMenus()
         }
-        monitor.onScroll = { [weak self] in if self?.screenshotCapturing == false, self?.floating.state.pinned == false { self?.dismiss() } }
-        monitor.onCancel = { [weak self] in self?.dismiss() }
-        monitor.onMenuCancel = { ModelMenuButton.cancelPresentedMenu(); TranslationResultTextView.cancelPresentedMenu() }
         shortcut.onPress = { [weak self] in self?.translateClipboard() }
         screenshotShortcut.onPress = { [weak self] in self?.beginScreenshot(binding: self?.preferences.screenshotShortcutBinding) }
         registerShortcut()
@@ -145,8 +140,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.monitor.enabled = !value
             self?.statusItem?.button?.appearsDisabled = value
             if value, self?.screenshotID == nil, self?.floating.state.pinned == false { self?.dismiss() }
-            if value { self?.builtinClient.cancelYoudaoPreparation() }
-            else if self?.services.youdao == true { self?.builtinClient.prepareYoudaoConnection() }
+            if value {
+                self?.builtinClient.cancelYoudaoPreparation()
+            }
+            else if self?.services.youdao == true, self?.engine.textSettings.translationEnabled == true { self?.builtinClient.prepareYoudaoConnection() }
         }.store(in: &subscriptions)
         chat.$activeID.dropFirst().sink { [weak self] _ in self?.dismiss() }.store(in: &subscriptions)
         var previouslySignedIn = chat.signedIn
@@ -162,6 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         api.$revision.dropFirst().sink { [weak self] _ in self?.dismiss() }.store(in: &subscriptions)
         observeServiceSwitches()
         observeServicesOrder()
+        observeTextSettings()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             MainActor.assumeIsolated {
@@ -203,7 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         title.target = self
         menu.addItem(title)
         menu.addItem(.separator())
-        let pause = menu.addItem(withTitle: preferences.paused ? "恢复自动划词" : "暂停自动划词", action: #selector(togglePaused), keyEquivalent: "")
+        let pause = menu.addItem(withTitle: preferences.paused ? "恢复划词" : "暂停划词", action: #selector(togglePaused), keyEquivalent: "")
         pause.target = self
         let clipboard = menu.addItem(withTitle: "翻译已复制文字", action: #selector(translateClipboard), keyEquivalent: ""); clipboard.target = self
         let screenshot = menu.addItem(withTitle: "截图翻译", action: #selector(translateScreenshot), keyEquivalent: ""); screenshot.target = self
@@ -212,11 +210,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid(), let id = app.bundleIdentifier {
             excludedCandidate = (id, app.localizedName ?? id)
             let excluded = preferences.excluded.contains(id)
-            let item = menu.addItem(withTitle: "\(excluded ? "恢复" : "暂停")在 \(app.localizedName ?? id) 中划词及悬停翻译", action: #selector(toggleExclusion), keyEquivalent: ""); item.target = self
+            let item = menu.addItem(withTitle: Self.exclusionMenuTitle(for: app.localizedName ?? id, excluded: excluded), action: #selector(toggleExclusion), keyEquivalent: ""); item.target = self
         } else { excludedCandidate = nil }
         menu.addItem(.separator())
         let settings = menu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ","); settings.target = self
         menu.addItem(.separator()); menu.addItem(withTitle: "退出轻译", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    }
+    static func exclusionMenuTitle(for name: String, excluded: Bool) -> String {
+        "在 \(name) 中\(excluded ? "恢复" : "暂停")划词与悬停翻译"
     }
     @objc func togglePaused() { preferences.paused.toggle(); if !preferences.paused { monitor.schedule() } }
     @objc func toggleExclusion() {
@@ -230,7 +231,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         presentSettings(.about)
     }
     private func presentSettings(_ section: SettingsSection) {
-        if api.activeProviderID.isEmpty { chat.restoreForSettings() }
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 680), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.title = "轻译设置"; window.isReleasedWhenClosed = false; window.contentMinSize = NSSize(width: 780, height: 600)
@@ -239,10 +239,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window.contentView = NSHostingView(rootView: SettingsView(preferences: preferences, chat: chat, api: api, navigation: settingsNavigation, updateShortcut: { [weak self] binding in self?.applyShortcut(binding) ?? false }, shortcutRecording: { [weak self] recording in self?.setShortcutRecording(recording) }, preview: { [weak self] in self?.showPreview() }, verify: { [weak self] in self?.verifyTranslation() }, services: services, requestSystemPermission: { [weak self] in self?.openSystemPermissions() }, updateScreenshotShortcut: { [weak self] in self?.applyScreenshotShortcut($0) ?? false }, requestScreenCapturePermission: { [weak self] in self?.manageScreenCapturePermission() }))
             window.center(); settingsWindow = window
         }
+        guard let window = settingsWindow else { return }
         settingsNavigation.open(section)
-        if let settingsWindow { CredentialWindowReturnCoordinator.shared.setSourceWindow(settingsWindow) }
-        NSApp.activate(ignoringOtherApps: true); settingsWindow?.makeKeyAndOrderFront(nil)
-        if api.activeProviderID.isEmpty, chat.signedIn, chat.models.isEmpty { Task { await chat.refreshModels() } }
+        CredentialWindowReturnCoordinator.shared.setSourceWindow(window)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        settingsAccountActivation?.cancel()
+        guard api.activeProviderID.isEmpty else { return }
+        settingsAccountActivation = whenSettingsWindowHasFocus(window) { [weak self] in
+            guard let self, self.api.activeProviderID.isEmpty else { return }
+            self.chat.restoreForSettings()
+            if self.chat.signedIn, self.chat.models.isEmpty { Task { await self.chat.refreshModels() } }
+        }
     }
     private func openSystemPermissions() {
         guard let settingsWindow = settingsWindow else { return }
@@ -307,7 +315,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!) { settingsReturn.cancel() }
     }
     private func beginScreenshot(binding: ShortcutBinding?) {
-        guard !screenshotCapturing else { return }
+        guard engine.textSettings.translationEnabled, !screenshotCapturing else { return }
+        closeActionPopup(); actionGesture.cancel()
         guard screenCaptureAccess() else {
             let firstRequest = !UserDefaults.standard.bool(forKey: "screenCapturePermissionRequested")
             if firstRequest {
@@ -376,7 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let source = try ScreenshotText.validate(cleaned)
                 self.screenshotTask = nil; self.screenshotWasVisible = false
                 if !keepPosition { self.floating.hide() }
-                self.startTranslation(source, keepPosition: true)
+                self.startTranslation(source, keepPosition: true, origin: .screenshot)
             } catch is CancellationError { }
             catch {
                 guard self.screenshotID == id, !Task.isCancelled else { return }
@@ -393,8 +402,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     private func showScreenshotRecognition(id: UUID, keepPosition: Bool) {
-        floating.showResult(source: "截图翻译", keepPosition: keepPosition, position: preferences.translationWindowPosition)
-        floating.state.sessionID = id; floating.state.status = "正在识别截图"
+        floating.showResult(sessionID: id, keepPosition: keepPosition, position: preferences.translationWindowPosition,
+                            loadingMessage: "正在识别截图中的文字…")
+        floating.state.status = "正在识别截图"
         floating.state.modelSelectionEnabled = false; floating.state.choice = nil; floating.state.defaultChoice = nil
         floating.state.temporaryModel = false; floating.state.loadingChatGPTModels = false
     }
@@ -406,32 +416,218 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if monitor.screenshotSuspended { monitor.setScreenshotSuspended(false) }
         if restore { floating.restoreAfterScreenshot(wasVisible: visible) }
     }
-    private func selectionChanged(_ snapshot: SelectionSnapshot?) {
+    private func configureSelectionDismissal() {
+        monitor.screenshotWorkPending = { [weak self] in
+            guard let self else { return false }
+            return self.screenshotTask != nil || (self.translationSession?.origin == .screenshot && self.floating.state.loading && !self.floating.state.pinned)
+        }
+        monitor.onSelection = { [weak self] in self?.selectionChanged($0) }
+        monitor.onSelectionInvalidated = { [weak self] in
+            guard let self else { return }
+            self.selectionChanged(nil, invalidatedByInput: true)
+        }
+        monitor.onContextChanged = { [weak self] in
+            guard let self, !self.monitor.defersSelectionForScreenshot else { return }
+            self.closeActionPopup(); self.actionGesture.cancel()
+            self.hover.cancel()
+            if self.hoverSessionActive, !self.floating.state.pinned,
+               NSWorkspace.shared.frontmostApplication?.processIdentifier != getpid() { self.dismiss() }
+        }
+        monitor.onOutsideClick = { [weak self] point in
+            guard let self, !self.screenshotCapturing else { return }
+            if !self.actionPopup.panel.frame.contains(point) { self.closeActionPopup() }
+            if !self.floating.state.pinned, !self.floating.contains(point) { self.dismiss() }
+        }
+        monitor.onScroll = { [weak self] in
+            guard let self, !self.screenshotCapturing else { return }
+            self.closeActionPopup()
+            if !self.floating.state.pinned { self.dismiss() }
+        }
+        monitor.onCancel = { [weak self] in
+            guard let self else { return }
+            if self.actionPopup.panel.isVisible { self.closeActionPopup() } else { self.dismiss() }
+        }
+    }
+    private func configureActionInteraction() {
+        preferences.$paused.dropFirst().filter { $0 }.sink { [weak self] _ in
+            self?.actionGesture.cancel(); self?.actionOwnsModifier = false; self?.closeActionPopup(); self?.floating.hideButton()
+        }.store(in: &subscriptions)
+        preferences.$excluded.dropFirst().sink { [weak self] _ in
+            self?.hover.cancel(); self?.actionGesture.cancel(); self?.closeActionPopup()
+        }.store(in: &subscriptions)
+        actionPopup.onDismiss = { [weak self] in self?.closeActionPopup() }
+        monitor.isOverAutomaticToolbar = { [weak self] point in
+            guard let self else { return false }
+            return self.actionPopup.panel.isVisible && self.actionPopup.presentation == .automatic && self.actionPopup.panel.frame.contains(point)
+        }
+        monitor.onExternalEvent = { [weak self] event in
+            guard let self else { return false }
+            // A deliberate new drag can reselect the exact same range after Escape.
+            if self.preferences.selectionMode == .toolbar && event.type == .leftMouseDragged { self.fingerprint = "" }
+            if self.routeActionEvent(event) { return true }
+            return self.hover.event(event)
+        }
+        monitor.onLocalEvent = { [weak self] event in
+            guard let self, self.actionPopup.panel.isVisible == false else { return }
+            // Modifier presses over the existing floating glyph are local events.
+            if event.type == .flagsChanged || event.type == .keyDown || event.type == .keyUp {
+                _ = self.routeActionEvent(event)
+            }
+        }
+        monitor.onTrackedEvent = { [weak self] event in
+            guard let self, self.actionPopup.panel.isVisible else { return }
+            if [.flagsChanged, .keyDown, .keyUp].contains(event.type) { _ = self.routeActionEvent(event) }
+            if event.type == .scrollWheel, !self.actionPopup.panel.frame.contains(NSEvent.mouseLocation) {
+                self.closeActionPopup()
+            } else if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type),
+                      !self.actionPopup.panel.frame.contains(NSEvent.mouseLocation) {
+                self.closeActionPopup()
+            }
+        }
+    }
+    private func routeActionEvent(_ event: NSEvent, requireFrontmost: Bool = true) -> Bool {
+        guard preferences.selectionMode == .compact else { return false }
+        let kind: AIActionGesture.Input
+        switch event.type {
+        case .flagsChanged: kind = .flags
+        case .keyDown: kind = .keyDown
+        case .keyUp: kind = .keyUp
+        case .leftMouseDown: kind = .leftDown
+        case .leftMouseUp: kind = .leftUp
+        case .scrollWheel: kind = .scroll
+        case .rightMouseDown, .otherMouseDown: kind = .otherMouseDown
+        default: return false
+        }
+        guard !engine.textSettings.displayedActions.isEmpty, !preferences.paused, screenshotID == nil else {
+            actionGesture = AIActionGesture(); actionOwnsModifier = false; closeActionPopup()
+            return false
+        }
+        actionGesture.reconcileKeys { CGEventSource.keyState(.combinedSessionState, key: $0) }
+        let flags = event.modifierFlags.intersection([.option, .control, .shift, .command, .function])
+        let modifier = engine.textSettings.actionModifier.flag
+        let newPress = kind == .flags && flags == modifier && actionGesture.flags.isEmpty
+        let wasVisible = actionPopup.panel.isVisible
+        let key = [.keyDown, .keyUp, .flagsChanged].contains(event.type) ? event.keyCode : 0
+        actionGesture.input(kind, flags: event.modifierFlags, key: key,
+                            time: event.timestamp, modifier: engine.textSettings.actionModifier)
+        let actions = pendingModifierActions(requireFrontmost: requireFrontmost)
+        let owns = actionOwnsModifier || !actions.isEmpty
+        if owns { actionOwnsModifier = true; hover.cancel() }
+        if wasVisible {
+            let releaseHold = kind == .flags && flags.isEmpty && engine.textSettings.actionTrigger == .hold
+            let toggleOff = newPress && engine.textSettings.actionTrigger == .press
+            let combination = kind == .flags && !flags.isEmpty && flags != modifier
+            let typing = kind == .keyDown && ![53, 123, 124, 125, 126, 36, 76].contains(key)
+            if releaseHold || toggleOff || combination || typing {
+                closeActionPopup()
+                if !releaseHold { actionGesture.cancel() }
+            }
+        } else {
+            _ = showActionPopupIfReady(actions)
+        }
+        if flags.isEmpty { actionOwnsModifier = false }
+        // Mouse-up must continue to the selection reader, even when this gesture owns the modifier.
+        return owns && event.type == .flagsChanged
+    }
+    private func pendingModifierActions(requireFrontmost: Bool = true) -> [TextOperation] {
+        // A drag may still have the previous selection while Accessibility reads the new one.
+        guard actionGesture.deadline != nil, !SelectionMonitor.isLeftMouseDown, let snapshot = selection,
+              !preferences.excluded.contains(NSRunningApplication(processIdentifier: snapshot.pid)?.bundleIdentifier ?? ""),
+              !requireFrontmost || NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.pid else { return [] }
+        let actions = engine.textSettings.selectionToolbarOperations(for: snapshot.text, mode: .compact)
+        if actions.isEmpty {
+            actionGesture.cancel()
+            actionOwnsModifier = false
+        }
+        return actions
+    }
+    @discardableResult private func showActionPopupIfReady(_ actions: [TextOperation]) -> Bool {
+        guard preferences.selectionMode == .compact, !actions.isEmpty, !preferences.paused, screenshotID == nil, !monitor.modelMenuTracking, let snapshot = selection,
+              actionGesture.tick(time: ProcessInfo.processInfo.systemUptime, hasSelection: true,
+                                 mouseDown: SelectionMonitor.isLeftMouseDown) else { return false }
+        hover.cancel(); actionOwnsModifier = true; floating.hideButton()
+        actionPopup.onSelect = { [weak self] operation in
+            guard let self else { return }
+            self.closeActionPopup()
+            guard self.engine.textSettings.enabled(operation) else { return }
+            self.triggered = true
+            self.startTranslation(snapshot.text, operation: operation)
+        }
+        floating.handleActionMenuTracking(true)
+        actionPopup.show(operations: actions, position: preferences.actionBarPosition, presentation: .modifier)
+        return true
+    }
+    private func showAutomaticToolbar(for snapshot: SelectionSnapshot) {
+        let operations = engine.textSettings.selectionToolbarOperations(for: snapshot.text, mode: .toolbar)
+        guard !operations.isEmpty else { closeActionPopup(); return }
+        let mouse = CGEvent(source: nil)?.location ?? .zero
+        actionPopup.onSelect = { [weak self] choice in
+            guard let self, self.actionPopup.panel.isVisible, self.actionPopup.presentation == .automatic,
+                  self.selection?.fingerprint == snapshot.fingerprint, self.toolbarReadID == nil else { return }
+            let readID = UUID()
+            self.toolbarReadID = readID
+            self.monitor.readForToolbar(pid: snapshot.pid, mouse: mouse) { [weak self] latest in
+                guard let self, self.toolbarReadID == readID else { return }
+                self.closeActionPopup()
+                guard self.preferences.selectionMode == .toolbar, !self.preferences.paused, self.screenshotID == nil,
+                      let latest, latest.pid == snapshot.pid,
+                      !self.preferences.excluded.contains(NSRunningApplication(processIdentifier: latest.pid)?.bundleIdentifier ?? ""),
+                      let operation = self.engine.textSettings.selectionToolbarOperations(for: latest.text, mode: .toolbar).first(where: { $0.key == choice.key }) else { return }
+                self.fingerprint = latest.fingerprint; self.selection = latest; self.triggered = true
+                self.startTranslation(latest.text, operation: operation)
+            }
+        }
+        actionPopup.show(operations: operations, position: preferences.actionBarPosition, presentation: .automatic)
+    }
+    private func closeActionPopup() {
+        toolbarReadID = nil
+        guard actionPopup.panel.isVisible else { return }
+        let tracked = actionPopup.presentation == .modifier
+        actionPopup.hide()
+        if tracked { floating.handleActionMenuTracking(false) }
+    }
+    private func selectionChanged(_ snapshot: SelectionSnapshot?, invalidatedByInput: Bool = false) {
         guard screenshotID == nil, !preferences.paused, !monitor.modelMenuTracking else { return }
+        // An older observer read can finish between a toolbar click and its queued
+        // verification. Only real input/context changes cancel that explicit click.
+        if toolbarReadID != nil, !invalidatedByInput, snapshot == nil || snapshot?.pid == selection?.pid {
+            if let snapshot { selection = snapshot }
+            return
+        }
         guard let snapshot = snapshot else {
-            fingerprint = ""; selection = nil
+            closeActionPopup()
+            if !invalidatedByInput || preferences.selectionMode == .compact { fingerprint = "" }
+            selection = nil
             if floating.state.pinned { floating.hideButton() } else { dismiss() }
             return
         }
-        guard !SelectionMonitor.isLeftMouseDown else { floating.hideButton(); return }
+        guard !SelectionMonitor.isLeftMouseDown else { closeActionPopup(); floating.hideButton(); return }
         if let id = NSRunningApplication(processIdentifier: snapshot.pid)?.bundleIdentifier, preferences.excluded.contains(id) {
+            closeActionPopup(); selection = nil
             if floating.state.pinned { floating.hideButton() } else { dismiss() }
             return
         }
         guard snapshot.fingerprint != fingerprint else { return }
-        if !floating.state.pinned { dismiss() } else { floating.hideButton() }
+        if !floating.state.pinned { dismiss() } else { closeActionPopup(); floating.hideButton() }
         fingerprint = snapshot.fingerprint; selection = snapshot; triggered = false
-        floating.offerAutomaticTranslation(for: snapshot.text, position: preferences.buttonPosition, preserveResult: floating.state.pinned)
+        if preferences.selectionMode == .toolbar {
+            showAutomaticToolbar(for: snapshot)
+            return
+        }
+        if showActionPopupIfReady(pendingModifierActions()) { return }
+        floating.offerAutomaticTranslation(for: snapshot.text, position: preferences.buttonPosition, preserveResult: floating.state.pinned, polishingEnabled: engine.textSettings.polishingEnabled, translationEnabled: engine.textSettings.translationEnabled)
     }
     private func trigger() {
         guard !triggered, let selection = selection, floating.buttonPanel.isVisible else { return }
-        guard TextPolicy.shouldOfferAutomaticTranslation(selection.text) else { floating.hideButton(); return }
-        triggered = true; startTranslation(selection.text)
+        guard let operation = TextPolicy.automaticSelectionOperation(selection.text) else { floating.hideButton(); return }
+        guard engine.textSettings.enabled(operation) else { floating.hideButton(); return }
+        triggered = true; startTranslation(selection.text, operation: operation)
     }
     @objc func translateClipboard() {
+        guard engine.textSettings.translationEnabled else { return }
         // Only this explicit shortcut/menu action reads the clipboard.
         let source = NSPasteboard.general.string(forType: .string) ?? ""
-        startTranslation(source)
+        startTranslation(source, origin: .clipboard)
     }
     private func retryTranslation() {
         if let image = screenshotImage, translationSession == nil, !screenshotCapturing {
@@ -443,8 +639,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             translateHoveredParagraph(at: context.point)
         }
     }
+    private func selectTemporaryModel(_ choice: TranslationChoice, sessionID: UUID) {
+        guard let session = translationSession, engine.textSettings.enabled(session.operation),
+              session.id == sessionID, translationSession?.select(choice) == true else { return }
+        performTranslation(keepPosition: true, only: .ai)
+    }
+    private func restoreTemporaryModel(sessionID: UUID) {
+        guard let session = translationSession, engine.textSettings.enabled(session.operation),
+              session.id == sessionID, translationSession?.restoreDefault() == true else { return }
+        performTranslation(keepPosition: true, only: .ai)
+    }
     private func translateHoveredParagraph(at point: CGPoint) {
-        guard screenshotID == nil, preferences.hoverEnabled, preferences.trusted, !monitor.modelMenuTracking,
+        guard screenshotID == nil, engine.textSettings.translationEnabled, preferences.hoverEnabled, preferences.trusted, !monitor.modelMenuTracking,
               let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid(),
               !preferences.excluded.contains(app.bundleIdentifier ?? "") else { return }
         let pid = app.processIdentifier
@@ -460,7 +666,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let result = Result { try HoverParagraphReader.read(pid: pid, point: point, ticket: ticket) }
             DispatchQueue.main.async {
                 guard let self = self, ticket.isCurrent, self.preferences.hoverEnabled,
-                      self.preferences.trusted, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+                      self.preferences.trusted, self.engine.textSettings.translationEnabled, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
                       !self.preferences.excluded.contains(app.bundleIdentifier ?? "") else { return }
                 self.hoverTicket = nil
                 switch result {
@@ -473,10 +679,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.translationSession = nil; self.cancelServiceTasks()
                     self.modelLoadingTask?.cancel(); self.modelLoadingTask = nil
                     self.hoverContext = (pid, point); self.hoverSessionActive = true
-                    self.floating.showResult(source: "悬停翻译", position: self.preferences.translationWindowPosition)
+                    self.floating.showResult(position: self.preferences.translationWindowPosition)
                     self.floating.state.text = error.localizedDescription
                     self.floating.state.loading = false; self.floating.state.error = true
-                    self.floating.state.sessionID = UUID(); self.floating.state.choice = nil
+                    self.floating.state.choice = nil
                     self.floating.state.defaultChoice = nil; self.floating.state.temporaryModel = false
                     self.floating.state.modelSelectionEnabled = false; self.floating.state.status = "无法读取段落"
                 }
@@ -484,22 +690,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     private func acceptHoveredParagraph(_ source: String, context: (pid: pid_t, point: CGPoint)? = nil) {
-        guard TextPolicy.needsTranslation(source) else {
+        guard engine.textSettings.translationEnabled, TextPolicy.needsTranslation(source) else {
             HoverDiagnostics.log("read skipped: no translation needed")
             return
         }
         hoverContext = context
-        startTranslation(source, fromHover: true)
+        startTranslation(source, origin: .hover)
     }
-    private func startTranslation(_ source: String, keepPosition: Bool = false, fromHover: Bool = false) {
+    private func startTranslation(_ source: String, keepPosition: Bool = false, origin: TranslationSession.Origin = .standard, operation: TextOperation = .translation) {
+        guard engine.textSettings.enabled(operation) else { return }
+        closeActionPopup()
         cancelScreenshot(restore: false)
-        hoverTicket?.cancel(); hoverTicket = nil; hoverSessionActive = fromHover
-        if !fromHover { hoverContext = nil }
+        hoverTicket?.cancel(); hoverTicket = nil; hoverSessionActive = origin == .hover
+        if origin != .hover { hoverContext = nil }
         cancelServiceTasks(); modelLoadingTask?.cancel(); modelLoadingTask = nil
-        let initial = services.ai ? (try? engine.defaultChoice()) : nil
-        translationSession = TranslationSession(source: source, defaultChoice: initial)
+        let initial = (operation.aiOnly || services.ai) ? (try? engine.defaultChoice(for: operation)) : nil
+        translationSession = TranslationSession(source: source, defaultChoice: initial, operation: operation, instructions: engine.textSettings.instructions(for: operation), origin: origin)
         floating.state.loadingChatGPTModels = false; floating.state.modelMenuMessage = ""
-        floating.state.services = services.order.filter { services.enabled($0) && ($0 != .ai || initial != nil) }.map { ServiceTranslationResult(id: $0) }
+        let activeServices: [TranslationServiceID] = operation.aiOnly ? [.ai] : services.order.filter { services.enabled($0) && ($0 != .ai || initial != nil) }
+        floating.state.services = activeServices.map { ServiceTranslationResult(id: $0) }
         performTranslation(keepPosition: keepPosition)
     }
     private func cancelServiceTasks() {
@@ -512,6 +721,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.floating.state.services = order.compactMap { id in results.first { $0.id == id } }
         }.store(in: &subscriptions)
     }
+    private func observeTextSettings() {
+        preferences.$selectionMode.dropFirst().sink { [weak self] _ in
+            guard let self else { return }
+            self.closeActionPopup(); self.floating.hideButton()
+            self.selection = nil; self.fingerprint = ""; self.actionGesture = AIActionGesture(); self.actionOwnsModifier = false
+        }.store(in: &subscriptions)
+        floating.onSwitchAction = { [weak self] operation, origin in
+            guard let self, let session = self.translationSession, session.id == origin else { return }
+            let settings = self.engine.textSettings
+            let available = session.alternativeActions(settings.orderedOperations, polishingEnabled: settings.polishingEnabled)
+            // Resolve the current action by ID; its prompt or model may have been edited with the menu open.
+            guard let target = available.first(where: { $0.key == operation.key }) else { return }
+            self.startTranslation(session.source, keepPosition: true, operation: target)
+        }
+        engine.textSettings.$orderedOperations.dropFirst().sink { [weak self] operations in
+            guard let self else { return }
+            self.closeActionPopup(); self.actionGesture = AIActionGesture(); self.actionOwnsModifier = false
+            self.floating.state.resultActions = self.translationSession?.alternativeActions(operations, polishingEnabled: self.engine.textSettings.polishingEnabled) ?? []
+            guard let action = self.translationSession?.operation.customAction else { return }
+            let available = operations.contains { $0.customAction?.id == action.id && $0.customAction?.enabled == true }
+            self.floating.state.actionAvailable = available
+            self.floating.state.modelSelectionEnabled = available
+        }.store(in: &subscriptions)
+        engine.textSettings.$actionModifier.dropFirst().sink { [weak self] _ in
+            self?.actionGesture = AIActionGesture(); self?.actionOwnsModifier = false; self?.closeActionPopup()
+        }.store(in: &subscriptions)
+        engine.textSettings.$actionTrigger.combineLatest(engine.textSettings.$actionDisplayLimit).dropFirst().sink { [weak self] _ in
+            self?.actionGesture = AIActionGesture(); self?.actionOwnsModifier = false; self?.closeActionPopup()
+        }.store(in: &subscriptions)
+        let switches: [(TextOperation, Published<Bool>.Publisher)] = [
+            (.translation, engine.textSettings.$translationEnabled), (.polishing, engine.textSettings.$polishingEnabled)
+        ]
+        for (operation, publisher) in switches {
+            publisher.dropFirst().sink { [weak self] enabled in
+                guard let self else { return }
+                // @Published sends before assigning the stored value. Use the publisher's value here.
+                if operation == .polishing {
+                    self.floating.state.resultActions = self.translationSession?.alternativeActions(self.engine.textSettings.orderedOperations, polishingEnabled: enabled) ?? []
+                }
+                self.fingerprint = ""
+                if self.preferences.selectionMode == .toolbar { self.closeActionPopup() }
+                guard !enabled else { return }
+                if self.floating.hoverButton.operation == operation { self.floating.hideButton() }
+                if operation == .translation {
+                    self.hover.cancel(); self.hoverTicket?.cancel(); self.hoverTicket = nil
+                    self.builtinClient.cancelYoudaoPreparation()
+                    if self.screenshotID != nil { self.cancelScreenshot(restore: true) }
+                }
+                if self.translationSession?.operation == operation || (operation == .translation && self.hoverSessionActive) { self.dismiss() }
+            }.store(in: &subscriptions)
+        }
+    }
+
     private func observeServiceSwitches() {
         let switches: [(TranslationServiceID, Published<Bool>.Publisher)] = [
             (.youdao, services.$youdao), (.google, services.$google), (.ai, services.$ai)
@@ -520,10 +782,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             enabled.dropFirst().sink { [weak self] isOn in
                 guard let self else { return }
                 if id == .youdao {
-                    if isOn, !self.preferences.paused { self.builtinClient.prepareYoudaoConnection() }
+                    if isOn, self.engine.textSettings.translationEnabled, !self.preferences.paused { self.builtinClient.prepareYoudaoConnection() }
                     else { self.builtinClient.cancelYoudaoPreparation() }
                 }
                 guard !isOn else { return }
+                guard self.translationSession?.operation.aiOnly != true else { return }
                 self.serviceTasks.removeValue(forKey: id)?.cancel()
                 guard self.floating.state.services.contains(where: { $0.id == id }) else { return }
                 if id == .ai { ModelMenuButton.cancelPresentedMenu() }
@@ -534,22 +797,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     private func performTranslation(keepPosition: Bool, only service: TranslationServiceID? = nil) {
-        if let service, !services.enabled(service) { return }
         guard let context = translationSession else { return }
+        guard engine.textSettings.enabled(context.operation) else { return }
+        if let service {
+            guard context.operation.aiOnly ? service == .ai : services.enabled(service) else { return }
+        }
         if service == nil {
             cancelServiceTasks()
             let cards = floating.state.services
-            floating.showResult(source: String(context.source.prefix(600)), keepPosition: keepPosition, position: preferences.translationWindowPosition)
+            floating.showResult(sessionID: context.id, keepPosition: keepPosition, position: preferences.translationWindowPosition, operation: context.operation)
             floating.state.services = cards
+            floating.state.resultActions = context.alternativeActions(engine.textSettings.orderedOperations, polishingEnabled: engine.textSettings.polishingEnabled)
         }
-        floating.state.sessionID = context.id
         floating.state.choice = context.choice.map { engine.choice(for: $0.target) }
         floating.state.defaultChoice = context.defaultChoice
         floating.state.temporaryModel = context.temporary
-        floating.state.modelSelectionEnabled = true
+        floating.state.modelSelectionEnabled = true; floating.state.actionAvailable = true
         floating.state.modelGroups = engine.modelGroups()
+        if context.origin == .clipboard && TextPolicy.clean(context.source).isEmpty {
+            floating.state.services = []
+            floating.state.text = "剪贴板中没有可翻译的文字。请先复制文字，再按翻译快捷键，或从菜单栏选择“翻译已复制文字”。"
+            floating.state.status = "剪贴板中没有可翻译的文字"
+            floating.state.loading = false; floating.state.error = true
+            floating.state.modelSelectionEnabled = false
+            return
+        }
         if floating.state.services.isEmpty {
-            floating.state.text = "请在设置中开启有道、谷歌翻译，或配置 AI 服务。"
+            floating.state.text = "在“设置 → 翻译”中开启有道翻译或谷歌翻译。要使用 AI 翻译，请开启“AI 翻译”并选好模型。"
             floating.state.loading = false; floating.state.error = true
             floating.state.status = "尚未启用翻译服务"
             return
@@ -566,10 +840,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 do {
                     let result: BuiltinTranslationResult
                     if id == .ai {
-                        guard let choice = context.choice else { throw QingyiError.message("请选择 AI 翻译模型。") }
-                        let text = try await engine.translate(context.source, target: choice.target, onDefaultRetry: { [weak self] in
-                            self?.updateService(id, sessionID: context.id, runID: runID) { $0.retryingWithDefault = true }
-                        }) { [weak self] text in
+                        guard let choice = context.choice else { throw QingyiError.message("请在设置中配置 AI 服务和模型，或临时选择已配置的模型以进行\(context.operation.action)。") }
+                        let text = try await engine.execute(context.source, target: choice.target, operation: context.operation, onEmptyRetry: { [weak self] in
+                            self?.updateService(id, sessionID: context.id, runID: runID) { $0.retryingEmptyResponse = true }
+                        }, instructions: context.instructions) { [weak self] text in
                             self?.updateService(id, sessionID: context.id, runID: runID) { $0.result.text = text }
                         }
                         result = BuiltinTranslationResult(text: text)
@@ -583,7 +857,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 } catch is CancellationError { }
                 catch {
                     guard !Task.isCancelled else { return }
-                    updateService(id, sessionID: context.id, runID: runID) { $0.error = self.readableError(error); $0.loading = false }
+                    let message = self.readableError(error)
+                    updateService(id, sessionID: context.id, runID: runID) {
+                        $0.error = context.operation == .polishing ? message.replacingOccurrences(of: "翻译", with: "润色") : message
+                        $0.loading = false
+                    }
                 }
             }
         }
@@ -601,7 +879,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         floating.state.complete = !floating.state.loading && results.contains { $0.error == nil }
         floating.state.error = !floating.state.loading && results.allSatisfy { $0.error != nil }
         floating.state.text = results.first(where: { $0.id == .ai })?.result.text ?? results.first(where: { $0.error == nil })?.result.copyText ?? ""
-        floating.state.status = floating.state.loading ? "正在翻译" : floating.state.error ? "翻译未完成" : results.contains(where: { $0.error != nil }) ? "部分完成" : "已完成"
+        let action = floating.state.operation.action
+        floating.state.status = floating.state.loading ? "正在\(action)" : floating.state.error ? "\(action)未完成" : results.contains(where: { $0.error != nil }) ? "部分完成" : "已完成"
     }
     private func loadTemporaryModels(sessionID: UUID) {
         guard translationSession?.id == sessionID, modelLoadingTask == nil else { return }
@@ -633,15 +912,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return error.localizedDescription
     }
     private func dismiss() {
+        closeActionPopup()
         cancelScreenshot(restore: false)
         hoverTicket?.cancel(); hoverTicket = nil; hoverSessionActive = false; hoverContext = nil
         translationSession = nil; cancelServiceTasks()
         modelLoadingTask?.cancel(); modelLoadingTask = nil; floating.hide()
     }
     @objc func showPreview() {
-        dismiss(); floating.showResult(source: "Small steps make complex things easier to understand.", preview: true, position: preferences.translationWindowPosition)
-        floating.state.text = "一步一步来，复杂的事情也能变得容易理解。"
-        floating.state.complete = true; floating.state.loading = false; floating.state.status = "界面预览 · 未调用模型"
+        dismiss(); floating.showResult(preview: true, position: preferences.translationWindowPosition)
+        TranslationWindowExample.populate(floating.state, fontSize: CGFloat(preferences.translationFontSize))
+        floating.fitContent()
     }
     func verifyTranslation() {
         startTranslation("Small steps make complex things easier to understand.")
@@ -651,6 +931,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func prepareScreenshotFixture(engine: TranslationEngine, capture: ScreenshotCapturing, ocr: ScreenshotRecognizing) {
         services = BuiltinTranslationSettings(defaults: UserDefaults(suiteName: "qingyi-fixture-services")!, enabledByDefault: false)
         self.engine = engine; screenshotCapture = capture; screenshotOCR = ocr; screenCaptureAccess = { true }
+        configureSelectionDismissal()
         floating.onRetry = { [weak self] in self?.retryTranslation() }
         floating.onClose = { [weak self] in self?.dismiss() }
     }
@@ -660,7 +941,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observeServicesOrder()
     }
     func retryBuiltinFixture(_ id: TranslationServiceID) { performTranslation(keepPosition: true, only: id) }
-    func screenshotClipboardFixture(_ text: String) { startTranslation(text) }
+    func prepareSelectionFixture(engine: TranslationEngine, client: BuiltinTranslationClient, settings: BuiltinTranslationSettings) {
+        prepareBuiltinFixture(engine: engine, client: client, settings: settings)
+        // These selections and modifier events are synthetic, independent of the user's mouse.
+        hover.pressedMouseButtons = { 0 }
+        observeTextSettings()
+        preferences.paused = false
+        floating.onTrigger = { [weak self] in self?.trigger() }
+        floating.onRetry = { [weak self] in self?.retryTranslation() }
+        floating.onRetryService = { [weak self] in self?.performTranslation(keepPosition: true, only: $0) }
+        floating.onSelectModel = { [weak self] in self?.selectTemporaryModel($0, sessionID: $1) }
+        floating.onRestoreModel = { [weak self] in self?.restoreTemporaryModel(sessionID: $0) }
+        floating.onClose = { [weak self] in self?.dismiss() }
+        floating.onModelMenuTracking = { [weak self] in self?.monitor.setModelMenuTracking($0) }
+        monitor.toolbarReadFixture = { [weak self] _, completion in completion(self?.selection) }
+        configureSelectionDismissal()
+        configureActionInteraction()
+    }
+    func feedSelectionFixture(_ text: String) {
+        let previous = SelectionMonitor.leftMouseDownOverride
+        SelectionMonitor.leftMouseDownOverride = false
+        defer { SelectionMonitor.leftMouseDownOverride = previous }
+        selectionChanged(SelectionSnapshot(text: text, anchor: nil, pid: getpid(), range: UUID().uuidString))
+    }
+    func startActionFixture(_ action: AIAction, source: String) { startTranslation(source, operation: .custom(action)) }
+    func showActionPopupFixture(source: String) {
+        // Opening this fixture represents a completed selection with the mouse released.
+        let previous = SelectionMonitor.leftMouseDownOverride
+        SelectionMonitor.leftMouseDownOverride = false
+        defer { SelectionMonitor.leftMouseDownOverride = previous }
+        feedSelectionFixture(source)
+        actionGesture = AIActionGesture()
+        actionGesture.input(.flags, flags: engine.textSettings.actionModifier.flag,
+                            time: ProcessInfo.processInfo.systemUptime - 1, modifier: engine.textSettings.actionModifier)
+        _ = showActionPopupIfReady(pendingModifierActions(requireFrontmost: false))
+    }
+    @discardableResult func routeActionEventFixture(_ event: NSEvent) -> Bool { routeActionEvent(event, requireFrontmost: false) }
+    @discardableResult func tickActionPopupFixture() -> Bool { showActionPopupIfReady(pendingModifierActions(requireFrontmost: false)) }
+    func screenshotClipboardFixture(_ text: String) { startTranslation(text, origin: .clipboard) }
     var screenshotActiveFixture: Bool { screenshotID != nil }
     func prepareHoverFixture(engine: TranslationEngine) {
         services = BuiltinTranslationSettings(defaults: UserDefaults(suiteName: "qingyi-fixture-services")!, enabledByDefault: false)
@@ -789,17 +1107,8 @@ if CommandLine.arguments.contains("--services-translation-check") {
 
 if CommandLine.arguments.contains("--default-translation-check") {
     Task { @MainActor in
-        do {
-            try AppRuntime.validate()
-            let engine = TranslationEngine(chat: ChatGPT(), configuration: APIConfigurationStore())
-            let result = try await engine.translate("Small steps make complex things easier to understand.", onUpdate: { _ in })
-            print("PASS real translation using the saved default service and model")
-            print("Example translation: \(result)")
-            exit(0)
-        } catch {
-            fputs("FAIL \(error.localizedDescription)\n", stderr)
-            exit(1)
-        }
+        let passed = await ReleaseModelCheck.run(arguments: CommandLine.arguments)
+        exit(passed ? 0 : 1)
     }
     dispatchMain()
 }
@@ -808,8 +1117,14 @@ if CommandLine.arguments.contains("--translation-check") {
     Task { @MainActor in
         do {
             try AppRuntime.validate()
-            let chat = ChatGPT()
-            let result = try await chat.translate("Small steps make complex things easier to understand.", diagnostic: { print($0) }, onUpdate: { _ in })
+            let chat = ChatGPT(diagnostic: { print($0) })
+            let choices = try await chat.loadTemporaryModels()
+            guard !chat.activeID.isEmpty, let model = choices.first(where: { $0.id == chat.modelID }) ?? choices.first else {
+                throw QingyiError.message("没有可用的 ChatGPT 模型，请在设置中选择模型。")
+            }
+            let engine = TranslationEngine(chat: chat, configuration: APIConfigurationStore())
+            let target = TranslationTarget(service: .chatGPT(chat.activeID), modelID: model.id)
+            let result = try await engine.translate("Small steps make complex things easier to understand.", target: target, onUpdate: { _ in })
             print("PASS real ChatGPT translation")
             print("Example translation: \(result)")
             exit(0)

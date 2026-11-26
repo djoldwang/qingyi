@@ -288,7 +288,7 @@ final class VisionScreenshotOCR: ScreenshotRecognizing, @unchecked Sendable {
                 let timer = Task<Void, Never> { [timeout] in
                     do {
                         try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                        operation.finish(.failure(QingyiError.message("截图文字识别超时，请缩小区域后重试。")))
+                        operation.finish(.failure(QingyiError.message("文字识别超时。点击“重试”可重新识别这张截图。如需缩小范围，请再次使用“截图翻译”并重新框选。")))
                     } catch { }
                 }
                 DispatchQueue.global(qos: .userInitiated).async { [self] in

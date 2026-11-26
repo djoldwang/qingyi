@@ -22,12 +22,14 @@ final class NativeModelMenuFixture: NSObject, NSApplicationDelegate {
     override init() {
         first = TranslationChoice(target: .init(service: .customAPI("fixture-a"), modelID: "default"), providerName: "测试 API A", modelName: "默认模型 A")
         second = TranslationChoice(target: .init(service: .customAPI("fixture-b"), modelID: "alternate"), providerName: "测试 API B", modelName: "临时模型 B")
-        session = TranslationSession(source: "Small steps make complex things easier to understand.", defaultChoice: first)
+        let polishing = CommandLine.arguments.contains("--native-polishing")
+        session = TranslationSession(source: polishing ? "云朵剧场的纸龙呢，它想邀请月亮兔来参加舞会，所以想麻烦你把那张会唱歌的请柬放进蓝色信封里。" : "Small steps make complex things easier to understand.", defaultChoice: first, operation: polishing ? .polishing : .translation)
         super.init()
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         floating.onSettings = { [weak self] in self?.settingsRequests += 1; self?.record() }
         floating.onRetry = { [weak self] in self?.retryRequests += 1; self?.record() }
+        floating.onRetryService = { [weak self] _ in self?.retryRequests += 1; self?.render() }
         floating.onClose = { [weak self] in
             guard let self = self else { return }
             self.explicitCloseRequests += 1
@@ -72,7 +74,7 @@ final class NativeModelMenuFixture: NSObject, NSApplicationDelegate {
             self.floating.state.modelGroups[self.floating.state.modelGroups.count - 1] = .init(name: "测试 ChatGPT", choices: [chat])
             self.floating.state.modelMenuMessage = "模型已加载（测试数据）"
         }
-        floating.showResult(source: session.source, preview: true)
+        floating.showResult(preview: true, operation: session.operation)
         floating.state.modelGroups = [
             .init(name: first.providerName, choices: [first]),
             .init(name: second.providerName, choices: [second,
@@ -97,7 +99,7 @@ final class NativeModelMenuFixture: NSObject, NSApplicationDelegate {
         record()
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        floating.state.source = session.source; render()
+        render()
         floating.resultPanel.makeKeyAndOrderFront(nil); return true
     }
     private func render() {
@@ -110,12 +112,19 @@ final class NativeModelMenuFixture: NSObject, NSApplicationDelegate {
         floating.state.complete = !floating.state.error
         floating.state.text = session.choice?.target.modelID == "long" ? String(repeating: "这是一段用于验证长译文自适应高度与内部滚动的模拟文本。", count: 200) : "一步一步来，复杂的事情也能变得容易理解。\n\n当前：\(session.choice!.label)"
         if floating.state.error { floating.state.text = "API 密钥无效或已过期，请编辑提供商配置。（HTTP 401）" }
+        if session.operation == .polishing {
+            if !floating.state.error, session.choice?.target.modelID != "long" {
+                floating.state.text = "云朵剧场的纸龙想邀请月亮兔参加舞会，请把会唱歌的请柬放进蓝色信封。"
+            }
+            floating.state.services = [ServiceTranslationResult(id: .ai, loading: false, error: floating.state.error ? floating.state.text : nil, result: .init(text: floating.state.text))]
+        }
     }
     private func record() {
         let frame = floating.resultPanel.frame
         let screen = floating.resultPanel.screen?.visibleFrame ?? .zero
         let value: [String: Any] = [
             "model": session.choice?.target.modelID ?? "", "temporary": session.temporary,
+            "operation": session.operation.action,
             "pinned": floating.state.pinned, "frame": [frame.minX, frame.minY, frame.width, frame.height],
             "visibleScreen": [screen.minX, screen.minY, screen.width, screen.height],
             "outsideCloseRequests": outsideCloseRequests, "escapeCloseRequests": escapeCloseRequests,

@@ -1,8 +1,8 @@
 import AppKit
 import SwiftUI
 
-struct TranslationTarget: Hashable {
-    enum Service: Hashable { case customAPI(String), chatGPT(String) }
+struct TranslationTarget: Hashable, Codable {
+    enum Service: Hashable, Codable { case customAPI(String), chatGPT(String) }
     let service: Service
     let modelID: String
     var usesChatGPT: Bool { if case .chatGPT = service { return true }; return false }
@@ -24,13 +24,18 @@ struct TranslationModelGroup {
 
 // Deliberately not Codable: this selection must never be persisted.
 struct TranslationSession {
+    enum Origin { case standard, clipboard, hover, screenshot }
     let id = UUID()
     let source: String
+    let origin: Origin
+    let operation: TextOperation
+    let instructions: String?
     let defaultChoice: TranslationChoice?
     private(set) var choice: TranslationChoice?
     private(set) var runID = UUID()
-    init(source: String, defaultChoice: TranslationChoice?) {
-        self.source = source; self.defaultChoice = defaultChoice; choice = defaultChoice
+    init(source: String, defaultChoice: TranslationChoice?, operation: TextOperation = .translation, instructions: String? = nil, origin: Origin = .standard) {
+        self.source = source; self.defaultChoice = defaultChoice; choice = defaultChoice; self.operation = operation
+        self.instructions = instructions; self.origin = origin
     }
     var temporary: Bool { choice?.target != defaultChoice?.target }
     @discardableResult mutating func select(_ next: TranslationChoice) -> Bool {
@@ -43,6 +48,21 @@ struct TranslationSession {
     }
     mutating func restart() { runID = UUID() }
     func accepts(sessionID: UUID, runID: UUID) -> Bool { id == sessionID && self.runID == runID }
+
+    func alternativeActions(_ orderedOperations: [TextOperation], polishingEnabled: Bool) -> [TextOperation] {
+        guard operation.aiOnly else { return [] }
+        let text = TextPolicy.clean(source)
+        guard !text.isEmpty, text.count <= TextPolicy.maximumLength else { return [] }
+        return orderedOperations.filter { candidate in
+            switch candidate {
+            case .translation: return false
+            case .polishing:
+                return operation != .polishing && polishingEnabled && (try? TextPolicy.validate(text, operation: .polishing)) != nil
+            case .custom(let action):
+                return action.enabled && action.id != operation.customAction?.id
+            }
+        }
+    }
 }
 
 struct TemporaryModelPicker: NSViewRepresentable {
@@ -60,9 +80,11 @@ struct TemporaryModelPicker: NSViewRepresentable {
             button.cancelMenu()
             button.sessionID = state.sessionID
         }
-        button.title = state.choice?.modelName ?? "选择翻译模型"
+        button.title = state.choice?.modelName ?? "选择\(state.operation.action)模型"
         button.isEnabled = state.modelSelectionEnabled
-        button.toolTip = "\(state.choice?.label ?? "选择模型")\n\(state.status)\(state.temporaryModel ? " · 仅本次" : "")\n点击切换模型，仅本次生效；将完整原文发送给所选服务并重新翻译。"
+        button.toolTip = "\(state.choice?.label ?? "选择模型")\n\(state.status)\(state.temporaryModel ? " · 仅本次" : "")\n点击切换模型，仅本次生效；将完整原文发送给所选服务并重新\(state.operation.action)。"
+        button.setAccessibilityLabel("临时切换\(state.operation.action)模型")
+        button.operation = state.operation
         button.setAccessibilityValue(state.choice?.label ?? "未选择模型")
         button.menuContent = { [state] in
             (state.modelGroups, state.choice, state.defaultChoice, state.modelMenuMessage, state.loadingChatGPTModels)
@@ -72,6 +94,7 @@ struct TemporaryModelPicker: NSViewRepresentable {
 }
 
 final class ModelMenuButton: NSButton {
+    var operation: TextOperation = .translation
     typealias MenuContent = ([TranslationModelGroup], TranslationChoice?, TranslationChoice?, String, Bool)
     var sessionID = UUID()
     var menuContent: (() -> MenuContent)?
@@ -142,7 +165,7 @@ final class ModelMenuButton: NSButton {
         let menu = NSMenu(); menu.autoenablesItems = false
         actions.removeAll(); selectedAction = nil
         guard let (groups, current, initial, message, loading) = menuContent?() else { return menu }
-        let heading = NSMenuItem(title: "临时切换 · 仅当前译文", action: nil, keyEquivalent: "")
+        let heading = NSMenuItem(title: "临时切换 · 仅当前\(operation.resultName)", action: nil, keyEquivalent: "")
         heading.isEnabled = false; menu.addItem(heading)
         add("恢复默认模型", action: .restore, to: menu, enabled: initial != nil && initial?.target != current?.target)
         if !message.isEmpty {

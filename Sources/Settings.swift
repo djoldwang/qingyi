@@ -3,13 +3,15 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case selection, window, services, general, about
+    case selection, translation, window, services, prompts, general, about
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .selection: return "翻译触发"
-        case .window: return "译文窗口"
-        case .services: return "翻译服务"
+        case .selection: return "划词"
+        case .translation: return "翻译"
+        case .window: return "结果窗口"
+        case .services: return "AI 服务"
+        case .prompts: return "AI 动作"
         case .general: return "通用"
         case .about: return "关于轻译"
         }
@@ -17,8 +19,10 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .selection: return "cursorarrow.rays"
+        case .translation: return "character.book.closed"
         case .window: return "macwindow"
         case .services: return "network"
+        case .prompts: return "text.bubble"
         case .general: return "slider.horizontal.3"
         case .about: return "info.circle"
         }
@@ -36,6 +40,11 @@ final class SettingsNavigation: NSObject, ObservableObject, NSWindowDelegate {
     @Published private(set) var detail: SettingsDetail?
     @Published var editorDirty = false
     @Published var confirmDiscard = false
+    @Published private(set) var discardRevision = 0
+    var discardTitle: String { section == .prompts && detail == nil ? "放弃未保存的提示词修改？" : "放弃未保存的 API 修改？" }
+    var discardMessage: String {
+        section == .prompts && detail == nil ? "尚未保存的提示词修改将被丢弃，已保存的提示词不受影响。" : "尚未保存的配置和密钥输入将被丢弃，已保存的配置不受影响。"
+    }
     private var pendingNavigation: (() -> Void)?
 
     init(section: SettingsSection = .selection, detail: SettingsDetail? = nil) {
@@ -54,6 +63,7 @@ final class SettingsNavigation: NSObject, ObservableObject, NSWindowDelegate {
     func discardAndContinue() {
         guard let action = pendingNavigation else { return }
         pendingNavigation = nil; editorDirty = false; confirmDiscard = false
+        discardRevision += 1
         action()
     }
     func continueEditing() { pendingNavigation = nil; confirmDiscard = false }
@@ -82,6 +92,20 @@ enum SettingsLayout {
     static let pageInset: CGFloat = 30
 }
 
+extension AITextSettings {
+    var selectionActionHint: String {
+        guard !displayedActions.isEmpty else {
+            return "要对选中文字使用自定义动作，请在“AI 动作”中新建或启用动作。"
+        }
+        switch actionTrigger {
+        case .press:
+            return "选中文字后，单独按一下 \(actionModifier.title) 打开自定义动作栏，再按一下关闭。"
+        case .hold:
+            return "选中文字后，单独按住 \(actionModifier.title) 显示自定义动作栏，松开即关闭。"
+        }
+    }
+}
+
 extension View {
     func settingsControlColumn(width: CGFloat = SettingsLayout.controlWidth) -> some View {
         self.frame(width: width, alignment: .trailing)
@@ -93,15 +117,22 @@ extension View {
 }
 
 struct SettingsGroup<Content: View>: View {
+    @Environment(\.colorScheme) private var colorScheme
     let title: String
+    var emphasized = false
     @ViewBuilder var content: Content
+    private var emphasis: Color { AIActionPalette.accent(for: colorScheme) }
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             if !title.isEmpty { Text(title).font(.system(size: 13, weight: .semibold)) }
             VStack(alignment: .leading, spacing: 0) { content }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .background(emphasized ? emphasis.opacity(0.045) : .clear, in: RoundedRectangle(cornerRadius: 9))
                 .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
-                .overlay(RoundedRectangle(cornerRadius: 9).stroke(Color.primary.opacity(0.09), lineWidth: 1))
+                .overlay(RoundedRectangle(cornerRadius: 9)
+                    .stroke(emphasized ? emphasis.opacity(0.55) : Color.primary.opacity(0.09), lineWidth: emphasized ? 1.25 : 1)
+                    .allowsHitTesting(false))
+                .shadow(color: emphasized ? emphasis.opacity(0.10) : .clear, radius: 8, x: 0, y: 3)
         }
     }
 }
@@ -115,11 +146,13 @@ struct SettingsRow<Content: View>: View {
     }
 }
 
+@MainActor
 struct SettingsView: View {
     @ObservedObject var preferences: Preferences
     @ObservedObject var chat: ChatGPT
     @ObservedObject var api: APIConfigurationStore
     @ObservedObject var navigation: SettingsNavigation
+    @ObservedObject private var textSettings: AITextSettings
     var updateShortcut: (ShortcutBinding) -> Bool
     var shortcutRecording: (Bool) -> Void
     var preview: () -> Void
@@ -136,6 +169,20 @@ struct SettingsView: View {
     @ViewState<Registration?> private var accountToDelete = nil
     private let accent = Color(red: 0.29, green: 0.34, blue: 0.82)
 
+    init(preferences: Preferences, chat: ChatGPT, api: APIConfigurationStore, navigation: SettingsNavigation,
+         updateShortcut: @escaping (ShortcutBinding) -> Bool, shortcutRecording: @escaping (Bool) -> Void,
+         preview: @escaping () -> Void, verify: @escaping () -> Void,
+         services: BuiltinTranslationSettings? = nil, loadsAccounts: Bool = true,
+         apiClient: CustomAPIClient = CustomAPIClient(), requestSystemPermission: (() -> Void)? = nil,
+         updateScreenshotShortcut: ((ShortcutBinding) -> Bool)? = nil, requestScreenCapturePermission: (() -> Void)? = nil) {
+        self.preferences = preferences; self.chat = chat; self.api = api; self.navigation = navigation
+        textSettings = api.textSettings
+        self.updateShortcut = updateShortcut; self.shortcutRecording = shortcutRecording
+        self.preview = preview; self.verify = verify; self.services = services ?? BuiltinTranslationSettings(); self.loadsAccounts = loadsAccounts
+        self.apiClient = apiClient; self.requestSystemPermission = requestSystemPermission
+        self.updateScreenshotShortcut = updateScreenshotShortcut; self.requestScreenCapturePermission = requestScreenCapturePermission
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             sidebar
@@ -144,6 +191,8 @@ struct SettingsView: View {
                 if case .api(let provider) = navigation.detail {
                     APIProviderEditor(api: api, provider: provider, client: apiClient, navigation: navigation)
                         .id(provider.id)
+                } else if navigation.section == .prompts && navigation.detail == nil {
+                    AIPromptEditor(api: api, chat: chat, client: apiClient)
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 24) {
@@ -151,13 +200,15 @@ struct SettingsView: View {
                             else {
                                 switch navigation.section {
                                 case .selection: selectionSettings
+                                case .translation: translationSettings
                                 case .window: windowSettings
                                 case .services:
-                                    TranslationServiceSettings(api: api, chat: chat, services: services, verify: verify,
+                                    TranslationServiceSettings(api: api, chat: chat, services: services, client: apiClient,
                                         edit: { navigation.open(.services, detail: .api($0)) },
                                         manageAccount: { navigation.open(.services, detail: .account) })
                                 case .general: generalSettings
                                 case .about: aboutSettings
+                                case .prompts: EmptyView()
                                 }
                             }
                         }.padding(SettingsLayout.pageInset).frame(maxWidth: .infinity, alignment: .leading)
@@ -174,13 +225,13 @@ struct SettingsView: View {
             case .failure(let error): exclusionMessage = "无法添加应用：\(error.localizedDescription)"
             }
         }
-        .alert("放弃未保存的 API 修改？", isPresented: $navigation.confirmDiscard) {
+        .alert(navigation.discardTitle, isPresented: $navigation.confirmDiscard) {
             Button("继续编辑", role: .cancel) { navigation.continueEditing() }
             Button("放弃修改", role: .destructive) { navigation.discardAndContinue() }
-        } message: { Text("尚未保存的配置和密钥输入将被丢弃，已保存的配置不受影响。") }
-        .alert("从轻译删除此账号？", isPresented: Binding(get: { accountToDelete != nil }, set: { if !$0 { accountToDelete = nil } }), presenting: accountToDelete) { account in
+        } message: { Text(navigation.discardMessage) }
+        .alert("从轻译中移除这个账号？", isPresented: Binding(get: { accountToDelete != nil }, set: { if !$0 { accountToDelete = nil } }), presenting: accountToDelete) { account in
             Button("取消", role: .cancel) { accountToDelete = nil }
-            Button("删除账号", role: .destructive) { chat.removeAccount(account.id); accountToDelete = nil }
+            Button("移除账号", role: .destructive) { chat.removeAccount(account.id); accountToDelete = nil }
         } message: { account in
             Text("将移除 \(chat.accountLabel(account)) 及其本机登录凭据和模型偏好，再次使用需要重新授权。")
         }
@@ -202,10 +253,15 @@ struct SettingsView: View {
                     Text("选中 · 轻触 · 读懂").font(.system(size: 10)).foregroundStyle(.secondary)
                 }
             }.padding(.horizontal, 8).padding(.top, 24).padding(.bottom, 28)
-            VStack(spacing: 5) {
+            ScrollView {
+              VStack(spacing: 5) {
                 ForEach(SettingsSection.allCases) { section in
                     Button { navigation.open(section) } label: {
-                        Label(section.title, systemImage: section.icon)
+                        HStack(spacing: 10) {
+                            Image(systemName: section.icon).frame(width: 16, height: 16)
+                                .accessibilityHidden(true)
+                            Text(section.title).lineLimit(1)
+                        }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 12).padding(.vertical, 10)
                             .contentShape(Rectangle())
@@ -216,12 +272,12 @@ struct SettingsView: View {
                     .accessibilityAddTraits(navigation.section == section ? .isSelected : [])
                     .accessibilityIdentifier("settings.section.\(section.rawValue)")
                 }
-            }
-            Spacer(minLength: 30)
+              }
+            }.scrollIndicators(.hidden).frame(maxHeight: .infinity).padding(.bottom, 16)
             permissionButton
             Text(AppVersion.display)
                 .font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 6).padding(.top, 12)
-            Text("原生 macOS 翻译工具").font(.system(size: 10)).foregroundStyle(.secondary)
+            Text("原生 macOS AI 文本工具").font(.system(size: 10)).foregroundStyle(.secondary)
                 .padding(.horizontal, 6).padding(.top, 2).padding(.bottom, 18)
         }.padding(.horizontal, 12).frame(width: 190)
             .background(Color(nsColor: .underPageBackgroundColor).opacity(0.5))
@@ -260,34 +316,57 @@ struct SettingsView: View {
             .accessibilityIdentifier(identifier)
     }
 
+    private func selectionPositionRow(_ title: String, selection: Binding<ButtonPosition>) -> some View {
+        SettingsRow {
+            Text(title).fixedSize(); Spacer()
+            Picker(title, selection: selection) {
+                ForEach(ButtonPosition.allCases) { Text($0.title).tag($0) }
+            }.labelsHidden().settingsControlColumn().help(selection.wrappedValue.title)
+                .disabled(preferences.paused)
+        }
+    }
+
     private var selectionSettings: some View {
         Group {
-            SettingsGroup(title: "划词翻译") {
+            SettingsGroup(title: "划词") {
                 SettingsRow {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("启用划词翻译")
-                        hint("关闭后不显示“译”按钮，悬停翻译和剪贴板翻译独立控制。")
+                        Text("启用划词")
+                        hint("在鼠标旁显示选中文字可用的动作。悬停、剪贴板和截图翻译可独立使用。")
                     }
                     Spacer()
-                    Toggle("启用划词翻译", isOn: $preferences.selectionEnabled).labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
+                    Toggle("启用划词", isOn: $preferences.selectionEnabled).labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
                         .accessibilityIdentifier("settings.selection.enabled")
                 }
                 Divider()
                 SettingsRow {
-                    Text("划词按钮位置").fixedSize(); Spacer()
-                    Picker("划词按钮位置", selection: $preferences.buttonPosition) {
-                        ForEach(ButtonPosition.allCases) { Text($0.title).tag($0) }
-                    }.labelsHidden().settingsControlColumn().help(preferences.buttonPosition.title)
-                        .disabled(preferences.paused)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 14) {
+                            Text("选中文字后").fixedSize(); Spacer()
+                            Picker("选中文字后", selection: $preferences.selectionMode) {
+                                ForEach(SelectionMode.allCases) { Text($0.title).tag($0) }
+                            }.labelsHidden().pickerStyle(.segmented).fixedSize()
+                                .accessibilityIdentifier("settings.selection.mode")
+                                .disabled(preferences.paused)
+                        }
+                        hint(preferences.selectionMode == .compact
+                             ? "将鼠标移到“译”或“润”上即可翻译或润色。启用自定义动作后，可用辅助键打开动作栏。"
+                             : "划词后列出适用的翻译或润色，以及已启用的自定义动作。点击动作即可执行。")
+                    }
                 }
-                SettingsRow { hint("松手后读取选区，显示“译”按钮。鼠标移入或点击按钮即可翻译。") }
+                Divider()
+                if preferences.selectionMode == .compact {
+                    selectionPositionRow("简洁按钮位置", selection: $preferences.buttonPosition)
+                    Divider()
+                }
+                selectionPositionRow("动作栏位置", selection: $preferences.actionBarPosition)
             }
-            hoverSettings
+            SelectionTrial(preferences: preferences, settings: textSettings) { navigation.open(.prompts) }
             SettingsGroup(title: "排除应用") {
                 SettingsRow {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(preferences.excluded.isEmpty ? "未排除任何软件" : "已排除 \(preferences.excluded.count) 个软件")
-                        hint("添加应用后，将暂停这些应用的自动划词和悬停翻译，不影响剪贴板翻译。")
+                        Text(preferences.excluded.isEmpty ? "尚未排除应用" : "已排除 \(preferences.excluded.count) 个应用")
+                        hint("排除应用后，轻译会暂停该应用内的划词和悬停翻译。剪贴板翻译和截图翻译仍可使用。")
                     }
                     Spacer()
                     Button { choosingExcludedApps = true } label: { Label("添加应用…", systemImage: "plus") }.settingsAction()
@@ -304,7 +383,7 @@ struct SettingsView: View {
                                 Spacer()
                                 Button("移除") {
                                     preferences.removeExclusion(id); exclusionMessage = ""
-                                }.settingsAction().accessibilityLabel("将 \(applicationName(id)) 移出排除列表，恢复自动划词及悬停翻译")
+                                }.settingsAction().accessibilityLabel("将 \(applicationName(id)) 移出排除列表，恢复划词及悬停翻译")
                             }
                         }
                     }
@@ -321,13 +400,29 @@ struct SettingsView: View {
         }
     }
 
+    private var translationSettings: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            SettingsGroup(title: "翻译") {
+                SettingsRow {
+                    hint("在“AI 动作”中打开或关闭“翻译”。此开关同时控制划词、悬停、剪贴板和截图四种翻译方式。")
+                    Spacer()
+                    Button("管理 AI 动作") { navigation.open(.prompts) }.settingsAction()
+                }
+            }
+            VStack(alignment: .leading, spacing: 24) {
+                TranslationServicesListView(store: services)
+                hoverSettings
+            }.disabled(!textSettings.translationEnabled).opacity(textSettings.translationEnabled ? 1 : 0.45)
+        }
+    }
+
     private var hoverSettings: some View {
         Group {
             SettingsGroup(title: "悬停翻译") {
                 SettingsRow {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("启用悬停翻译")
-                        hint("无需选中文字，触发后直接显示当前段落的译文。")
+                        hint("将鼠标放在外语段落上，按下方设置的方式查看译文。")
                     }
                     Spacer()
                     Toggle("启用悬停翻译", isOn: $preferences.hoverEnabled)
@@ -336,19 +431,26 @@ struct SettingsView: View {
                 }
                 Divider()
                 SettingsRow {
-                    Text("触发方式").fixedSize(); Spacer()
-                    Picker("触发方式", selection: $preferences.hoverTrigger) {
-                        ForEach(HoverTrigger.allCases) { Text($0.title).tag($0) }
+                    Text("动作辅助键").fixedSize(); Spacer()
+                    Picker("动作辅助键", selection: $preferences.hoverModifier) {
+                        ForEach(AIActionModifier.allCases) { Text($0.title).tag($0) }
                     }.labelsHidden().settingsControlColumn()
-                        .accessibilityIdentifier("settings.hover.trigger")
-                        .disabled(!preferences.hoverEnabled)
+                        .accessibilityIdentifier("settings.hover.modifier")
+                        .disabled(!preferences.hoverEnabled || preferences.hoverActivation == .mouseHold)
                 }
+                Divider()
                 SettingsRow {
-                    VStack(alignment: .leading, spacing: 6) {
-                        hint(preferences.hoverTrigger == .longPress
-                             ? "将鼠标放在段落上，按住左键 0.6 秒即可翻译。移动超过 6 点会取消触发，正常拖选不受影响。"
-                             : "将鼠标放在段落上，单独按下并松开所选按键即可翻译；组合按键、鼠标点击或移动会取消触发。")
-                        hint("默认关闭，开启后与自动划词独立工作。中文自动跳过，不显示译文窗口。")
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 14) {
+                            Text("触发方式").fixedSize(); Spacer()
+                            Picker("触发方式", selection: $preferences.hoverActivation) {
+                                ForEach(HoverActivation.allCases) { Text($0.title).tag($0) }
+                            }.labelsHidden().settingsControlColumn()
+                                .accessibilityIdentifier("settings.hover.trigger")
+                                .disabled(!preferences.hoverEnabled)
+                        }
+                        hint(preferences.hoverActivation.hint)
+                        hint("选用“简洁按钮”并设置相同辅助键时，已有选区优先显示自定义动作栏。悬停翻译默认关闭，中文自动跳过。")
                     }
                 }
             }
@@ -365,17 +467,17 @@ struct SettingsView: View {
                     }.labelsHidden().settingsControlColumn().help(preferences.translationWindowPosition.title)
                 }
             }
-            SettingsGroup(title: "译文字号") {
+            SettingsGroup(title: "文字大小") {
                 SettingsRow {
                     TranslationFontSizeSlider(selection: $preferences.translationFontSize, accent: accent)
                 }
             }
             SettingsWindowIllustration(position: preferences.translationWindowPosition, fontSize: CGFloat(preferences.translationFontSize))
             HStack(spacing: 12) {
-                Button("预览翻译浮窗", action: preview)
-                hint("预览不调用模型。")
+                Button("预览结果窗口", action: preview)
+                hint("预览使用本地示例译文。")
             }
-            hint("窗口高度随内容调整，长内容内部滚动。拖动顶部可移动窗口，钉住后持续显示；关闭后下次使用默认位置。")
+            hint("结果较长时，可在窗口内滚动阅读。拖动顶部可移动窗口，钉住后切换应用也能继续查看。关闭后再打开，窗口会回到默认位置。")
         }
     }
 
@@ -392,14 +494,14 @@ struct SettingsView: View {
             if !preferences.generalMessage.isEmpty { hint(preferences.generalMessage) }
             SettingsGroup(title: "快捷键") {
                 SettingsRow {
-                    VStack(alignment: .leading, spacing: 3) { Text("翻译已复制文字"); hint("点击右侧录制新的快捷键。") }
+                    VStack(alignment: .leading, spacing: 3) { Text("翻译已复制文字"); hint("点击右侧的快捷键，再按下想用的组合键。") }
                     Spacer()
                     ShortcutRecorder(binding: preferences.shortcutBinding, onCandidate: updateShortcut, onRecording: shortcutRecording)
                         .frame(width: 185, height: 28).settingsControlColumn()
                 }
                 Divider()
                 SettingsRow {
-                    VStack(alignment: .leading, spacing: 3) { Text("截图翻译"); hint("松开快捷键后框选，自动识别并翻译。") }
+                    VStack(alignment: .leading, spacing: 3) { Text("截图翻译"); hint("松开快捷键，框选要翻译的外语文字。等待译文时，可以继续滚动原页面。") }
                     Spacer()
                     ShortcutRecorder(binding: preferences.screenshotShortcutBinding, actionName: "截图翻译", onCandidate: { updateScreenshotShortcut?($0) ?? false }, onRecording: shortcutRecording)
                         .frame(width: 185, height: 28).settingsControlColumn()
@@ -414,7 +516,7 @@ struct SettingsView: View {
 
     private var accountSettings: some View {
         Group {
-            Button { navigation.open(.services) } label: { Label("翻译服务", systemImage: "chevron.left") }.buttonStyle(.link)
+            Button { navigation.open(.services) } label: { Label("AI 服务", systemImage: "chevron.left") }.buttonStyle(.link)
             SettingsGroup(title: "当前账号") {
                 SettingsRow {
                     VStack(alignment: .leading, spacing: 4) {
@@ -450,7 +552,7 @@ struct SettingsView: View {
             if !chat.registrations.isEmpty { savedAccounts }
             accountModels
             Link("管理用量 ↗", destination: URL(string: "https://chatgpt.com/#settings/Usage")!)
-            hint("默认翻译模型统一在“翻译服务”首页选择。")
+            hint("在“AI 服务”的“全局 AI 模型”中选择默认模型。")
         }
     }
 
@@ -474,8 +576,8 @@ struct SettingsView: View {
                     if account.id == chat.activeID {
                         Text("当前账号").font(.system(size: 11, weight: .medium)).foregroundStyle(accent).fixedSize()
                     } else { Button("切换") { chat.selectAccount(account.id) }.disabled(chat.busy).settingsAction() }
-                    Button("删除", role: .destructive) { accountToDelete = account }.disabled(chat.busy).settingsAction()
-                        .accessibilityLabel("删除账号 \(chat.accountLabel(account))")
+                    Button("移除", role: .destructive) { accountToDelete = account }.disabled(chat.busy).settingsAction()
+                        .accessibilityLabel("移除账号 \(chat.accountLabel(account))")
                 }
             }
         }
@@ -539,16 +641,20 @@ struct SettingsView: View {
                 hint(AppVersion.display)
             }.frame(maxWidth: .infinity).padding(.bottom, 4)
             SettingsGroup(title: "隐私与数据") {
-                privacyRow("主动触发，才发送待翻译文字", "文字发送给你选择的翻译服务，划词检测与截图文字识别在本机完成。")
+                privacyRow("按需发送文字", "划词检测和截图文字识别都在本机完成。翻译时，轻译会把原文发给已开启的翻译服务。润色或执行自定义动作时，原文和提示词只发给该动作选用的 AI。")
                 Divider()
-                privacyRow("默认不保存翻译历史", "默认不保存原文、译文或翻译历史。")
+                privacyRow("不保存原文与译文", "本机仅保留配置及不含正文的模型思考状态记录。")
                 Divider()
-                privacyRow("凭据保存在 macOS 钥匙串", "账号及模型配置保存在本机。")
+                privacyRow("凭据保存在 macOS 钥匙串", "ChatGPT 凭据和 API 密钥保存在钥匙串；账号、模型与功能偏好保存在本机。")
             }
-            SettingsGroup(title: "当前能力") {
-                SettingsRow { hint("支持划词、悬停、剪贴板及截图翻译。外语译为简体中文，单次最多 12,000 字。") }
+            SettingsGroup(title: "主要功能") {
+                privacyRow("翻译与润色", "支持划词、悬停、剪贴板和截图翻译，以及中文划词润色。")
                 Divider()
-                SettingsRow { hint("图片及扫描件可通过截图识别后翻译。文字在本机识别，仅将识别出的文字发送给当前翻译服务。") }
+                privacyRow("自定义 AI 动作", "可为每个动作设置提示词和模型。划词后可直接显示动作栏，也可在简洁按钮模式下用辅助键打开。")
+                Divider()
+                privacyRow("模型与思考模式", "支持 ChatGPT 和自定义 API。动作可跟随全局或独立选模型，思考模式默认开启。")
+                Divider()
+                privacyRow("文字与图片", "图片及扫描件可通过截图在本机识别文字。AI 单次最多 12,000 字，有道、谷歌单次最多 5,000 字。")
             }
         }
     }
@@ -577,10 +683,10 @@ struct TranslationFontSizeSlider: View {
     var body: some View {
         HStack(spacing: 12) {
             Text("A").font(.system(size: 11)).foregroundStyle(.secondary).accessibilityHidden(true)
-            Slider(value: $selection, in: TranslationFontSize.range) { Text("译文字号") }
+            Slider(value: $selection, in: TranslationFontSize.range) { Text("文字大小") }
                 .labelsHidden().tint(accent).frame(minWidth: 160)
                 .accessibilityValue("\(selection.formatted(.number.precision(.fractionLength(1)))) 点")
-                .help("拖动调整译文字号，范围 12–24 pt，默认 15 pt。")
+                .help("拖动调整文字大小，范围 12–24 pt，默认 15 pt。")
             Text("A").font(.system(size: 20)).foregroundStyle(.secondary).accessibilityHidden(true)
             Text("\(selection, specifier: "%.1f") pt").font(.system(size: 12).monospacedDigit())
                 .foregroundStyle(.secondary).frame(width: 62, alignment: .trailing)
@@ -597,32 +703,58 @@ private struct SettingsPreviewHeight: PreferenceKey {
 
 struct SettingsWindowIllustration: View {
     let position: TranslationWindowPosition
-    var fontSize: CGFloat = 15
+    let fontSize: CGFloat
+    @StateObject private var example: FloatingState
     @ViewState<CGFloat> private var cardHeight: CGFloat = 0
+    private let scale: CGFloat = 0.75
+    private let menuHeight: CGFloat = 22
+    private let pointer = CGPoint(x: 116, y: 84)
+
+    init(position: TranslationWindowPosition, fontSize: CGFloat = 15) {
+        self.position = position
+        self.fontSize = fontSize
+        _example = StateObject(wrappedValue: {
+            let state = FloatingState()
+            TranslationWindowExample.populate(state, fontSize: fontSize)
+            return state
+        }())
+    }
+
     var body: some View {
         GeometryReader { geometry in
+            // Use the same screen coordinates and edge clamping as the floating panel.
+            let screen = CGRect(x: 0, y: 0, width: geometry.size.width / scale, height: (geometry.size.height - menuHeight) / scale)
+            let mouse = CGPoint(x: pointer.x / scale, y: (geometry.size.height - pointer.y) / scale)
+            let frame = TranslationWindowLayout.frame(contentHeight: cardHeight, position: position, pointer: mouse, screen: screen)
             ZStack(alignment: .topLeading) {
                 Color(nsColor: .underPageBackgroundColor)
                 Text("轻译　文件　编辑").font(.system(size: 10)).foregroundStyle(.secondary)
-                    .padding(.horizontal, 10).frame(maxWidth: .infinity, alignment: .leading).frame(height: 22)
+                    .padding(.horizontal, 10).frame(maxWidth: .infinity, alignment: .leading).frame(height: menuHeight)
                     .background(Color(nsColor: .controlBackgroundColor))
-                Text("Small steps make things easier.").font(.system(size: 11)).foregroundStyle(.secondary).offset(x: 24, y: 85)
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack { Image(systemName: "pin"); Spacer(); Text("—"); Spacer(); Image(systemName: "xmark") }.font(.system(size: 10)).foregroundStyle(.secondary)
-                    Text("Small steps make things easier.").font(.system(size: 10)).foregroundStyle(.secondary)
-                    Text("小小的进步，让事情变得更简单。").font(.system(size: fontSize * 0.8)).fixedSize(horizontal: false, vertical: true)
-                    Divider()
-                    HStack { Text("默认模型 ⌄"); Spacer(); Image(systemName: "doc.on.doc") }.font(.system(size: 10)).foregroundStyle(.secondary)
-                }.padding(12).frame(width: 220).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.12), lineWidth: 1))
+                Text(TranslationWindowExample.source).font(.system(size: 11))
+                    .padding(.horizontal, 4).padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.15), in: RoundedRectangle(cornerRadius: 2))
+                    .frame(maxWidth: .infinity, alignment: position == .upperLeft ? .trailing : .leading)
+                    .padding(.horizontal, 20).offset(y: 66)
+                if position == .belowPointer {
+                    Image(systemName: "cursorarrow").font(.system(size: 13))
+                        .offset(x: pointer.x, y: pointer.y)
+                }
+                TranslationCard(state: example, close: {}, retry: {}, settings: {}, fitsServiceContent: true)
+                    .frame(width: TranslationWindowLayout.width)
+                    .fixedSize(horizontal: false, vertical: true)
                     .background(GeometryReader { card in
                         Color.clear.preference(key: SettingsPreviewHeight.self, value: card.size.height)
                     })
-                    .offset(x: position == .upperRight ? max(0, geometry.size.width - 232) : min(95, max(0, geometry.size.width - 232)), y: position == .upperRight ? 28 : 93)
+                    .scaleEffect(scale, anchor: .topLeading)
+                    .offset(x: frame.minX * scale, y: geometry.size.height - frame.maxY * scale)
             }
-        }.frame(height: max(250, cardHeight + (position == .upperRight ? 28 : 93) + 12))
+        }.frame(height: max(250, cardHeight * scale + (position.isScreenCorner ? menuHeight : pointer.y + 12 * scale) + 12))
             .onPreferenceChange(SettingsPreviewHeight.self) { cardHeight = $0 }
+            .onChange(of: fontSize) { _, size in example.fontSize = size }
             .clipShape(RoundedRectangle(cornerRadius: 9))
-            .accessibilityLabel("译文窗口位置示意：\(position.title)")
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("结果窗口位置示意：\(position.title)")
     }
 }

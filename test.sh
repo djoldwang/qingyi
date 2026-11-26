@@ -26,10 +26,17 @@ xcrun swiftc -D QINGYI_TESTING -swift-version 5 -target arm64-apple-macos14.0 -m
   "$qingyi_root/Sources/TemporaryModels.swift" "$qingyi_root/Tests/TemporaryModelTests.swift" \
   "$qingyi_root/Tests/NativeModelMenuFixture.swift" \
   "$qingyi_root/Sources/TranslationWindow.swift" \
-  "$qingyi_root/Sources/Settings.swift" \
+  "$qingyi_root/Sources/ResultActionButtons.swift" \
+  "$qingyi_root/Sources/Settings.swift" "$qingyi_root/Sources/SelectionTrial.swift" \
+  "$qingyi_root/Sources/AIActionInteraction.swift" \
+  "$qingyi_root/Sources/AIActionHeader.swift" \
+  "$qingyi_root/Sources/AITextSettings.swift" "$qingyi_root/Sources/AITextSettingsViews.swift" \
   "$qingyi_root/Sources/SettingsReturn.swift" \
   "$qingyi_root/Tests/SettingsTests.swift" \
   "$qingyi_root/Tests/ReleaseTests.swift" \
+  "$qingyi_root/Tests/PolishingTests.swift" \
+  "$qingyi_root/Tests/AITextSettingsTests.swift" \
+  "$qingyi_root/Tests/AIActionTests.swift" \
   "$qingyi_root/Tests/NativeSettingsFixture.swift" \
   -o "$qingyi_work/QingyiTests" -framework AppKit -framework SwiftUI -framework Carbon -framework Security \
   -framework WebKit -framework CryptoKit -framework Network -framework NaturalLanguage -framework ApplicationServices -framework ServiceManagement -framework Vision

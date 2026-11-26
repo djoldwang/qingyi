@@ -10,9 +10,16 @@ enum TranslationFontSize {
 }
 
 enum TranslationWindowPosition: String, CaseIterable, Identifiable {
-    case upperRight, belowPointer
+    case upperRight, upperLeft, belowPointer
     var id: String { rawValue }
-    var title: String { self == .upperRight ? "屏幕右上角" : "鼠标右下方" }
+    var title: String {
+        switch self {
+        case .upperRight: return "屏幕右上角"
+        case .upperLeft: return "屏幕左上角"
+        case .belowPointer: return "鼠标右下方"
+        }
+    }
+    var isScreenCorner: Bool { self != .belowPointer }
 }
 
 enum TranslationWindowLayout {
@@ -23,18 +30,16 @@ enum TranslationWindowLayout {
     static let footerHeight: CGFloat = 32
     static let minimumHeight: CGFloat = 128
     static let bodyPadding: CGFloat = 18
-    static let paragraphGap: CGFloat = 14
-    @MainActor static func contentHeight(source: String, text: String, error: Bool = false, fontSize: CGFloat = 15) -> CGFloat {
-        // Measure the same SwiftUI body that is displayed, including the capped
-        // source, actual line wrapping, error icon, line spacing and padding.
-        let hosting = NSHostingView(rootView: TranslationBody(source: source, text: text, error: error, fontSize: fontSize))
+    @MainActor static func contentHeight(text: String, error: Bool = false, fontSize: CGFloat = 15,
+                                         operation: TextOperation = .translation, loadingMessage: String? = nil) -> CGFloat {
+        let hosting = NSHostingView(rootView: TranslationBody(text: text, error: error, fontSize: fontSize, operation: operation, loadingMessage: loadingMessage))
         hosting.layoutSubtreeIfNeeded()
         let chrome = headerHeight + footerHeight + 2 // Both dividers.
         return max(minimumHeight, chrome + ceil(hosting.fittingSize.height) + 1)
     }
     static func frame(contentHeight: CGFloat, position: TranslationWindowPosition, pointer: NSPoint, screen: NSRect, manualTopLeft: NSPoint? = nil) -> NSRect {
-        let flushUpperRight = position == .upperRight && manualTopLeft == nil
-        var maximumHeight = max(100, screen.height - (flushUpperRight ? margin : 2 * margin))
+        let flushCorner = position.isScreenCorner && manualTopLeft == nil
+        var maximumHeight = max(100, screen.height - (flushCorner ? margin : 2 * margin))
         let spaceBelow = manualTopLeft.map { $0.y - screen.minY - margin } ??
             (position == .belowPointer ? pointer.y - 12 - screen.minY - margin : maximumHeight)
         if spaceBelow >= minimumHeight { maximumHeight = min(maximumHeight, spaceBelow) }
@@ -43,31 +48,33 @@ enum TranslationWindowLayout {
         let origin: NSPoint
         if let manual = manualTopLeft { origin = NSPoint(x: manual.x, y: manual.y - height) }
         else if position == .upperRight { origin = NSPoint(x: screen.maxX - width, y: screen.maxY - height) }
+        else if position == .upperLeft { origin = NSPoint(x: screen.minX, y: screen.maxY - height) }
         else { origin = FloatingController.belowPointer(pointer, size: size) }
-        return NSRect(origin: FloatingController.clamped(origin, size: size, screen: screen, inset: flushUpperRight ? 0 : 10), size: size)
+        return NSRect(origin: FloatingController.clamped(origin, size: size, screen: screen, inset: flushCorner ? 0 : 10), size: size)
     }
 }
 
 struct TranslationBody: View, Equatable {
-    let source: String
     let text: String
     let error: Bool
     var dark = false
     var fontSize: CGFloat = 15
+    var operation: TextOperation = .translation
+    var loadingMessage: String?
     var body: some View {
-        VStack(alignment: .leading, spacing: TranslationWindowLayout.paragraphGap) {
-            Text(source).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(3)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        Group {
             if error {
                 Label(text, systemImage: "exclamationmark.circle").font(.system(size: 14))
                     .foregroundStyle(.orange).textSelection(.enabled)
             } else if text.isEmpty {
-                Text("正在将选中文字译成中文…").foregroundStyle(.secondary).font(.system(size: 14))
+                Text(loadingMessage ?? (operation == .translation ? "正在将选中文字译成中文…" : "正在\(operation.action)…"))
+                    .foregroundStyle(.secondary).font(.system(size: 14))
             } else {
-                TranslationResultText(text: text, dark: dark, fontSize: fontSize)
+                TranslationResultText(text: text, dark: dark, fontSize: fontSize, operation: operation)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(TranslationWindowLayout.bodyPadding)
         .frame(width: TranslationWindowLayout.width)
         .fixedSize(horizontal: false, vertical: true)
@@ -79,10 +86,12 @@ struct TranslationResultText: NSViewRepresentable {
     let text: String
     let dark: Bool
     var fontSize: CGFloat = 15
+    var operation: TextOperation = .translation
     func makeNSView(context: Context) -> TranslationResultTextView {
-        TranslationResultTextView(text: text, dark: dark, fontSize: fontSize)
+        TranslationResultTextView(text: text, dark: dark, fontSize: fontSize, operation: operation)
     }
     func updateNSView(_ view: TranslationResultTextView, context: Context) {
+        view.setAccessibilityLabel(operation.accessibilityResultName)
         view.updateText(text, dark: dark, fontSize: fontSize)
     }
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: TranslationResultTextView, context: Context) -> CGSize? {
@@ -99,7 +108,7 @@ final class TranslationResultTextView: NSTextView, NSMenuDelegate {
     private weak var menuOwner: TranslationPanel?
     private static weak var presentingTextView: TranslationResultTextView?
     static func cancelPresentedMenu() { presentingTextView?.activeMenu?.cancelTrackingWithoutAnimation() }
-    init(text: String, dark: Bool, fontSize: CGFloat = 15) {
+    init(text: String, dark: Bool, fontSize: CGFloat = 15, operation: TextOperation = .translation) {
         let storage = NSTextStorage()
         let manager = NSLayoutManager()
         let width = TranslationWindowLayout.width - 2 * TranslationWindowLayout.bodyPadding
@@ -112,7 +121,7 @@ final class TranslationResultTextView: NSTextView, NSMenuDelegate {
         isHorizontallyResizable = false; isVerticallyResizable = true
         minSize = .zero; maxSize = NSSize(width: width, height: .greatestFiniteMagnitude)
         allowsUndo = false
-        setAccessibilityLabel("中文译文")
+        setAccessibilityLabel(operation.accessibilityResultName)
         updateText(text, dark: dark, fontSize: fontSize)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -176,20 +185,23 @@ final class TranslationResultTextView: NSTextView, NSMenuDelegate {
 }
 
 struct TranslationBodyScrollArea: NSViewRepresentable {
-    let source: String
+    let sessionID: UUID
     let text: String
     let error: Bool
     let dark: Bool
     var fontSize: CGFloat = 15
+    var operation: TextOperation = .translation
+    var loadingMessage: String?
     func makeNSView(context: Context) -> TranslationBodyScrollView { TranslationBodyScrollView() }
     func updateNSView(_ view: TranslationBodyScrollView, context: Context) {
-        view.updateBody(TranslationBody(source: source, text: text, error: error, dark: dark, fontSize: fontSize))
+        view.updateBody(TranslationBody(text: text, error: error, dark: dark, fontSize: fontSize, operation: operation,
+                                       loadingMessage: loadingMessage), sessionID: sessionID)
     }
 }
 
 final class TranslationBodyScrollView: NSScrollView {
-    private let hosting = NSHostingView(rootView: AnyView(TranslationBody(source: "", text: "", error: false)))
-    private var servicesSource: String?
+    private let hosting = NSHostingView(rootView: AnyView(TranslationBody(text: "", error: false)))
+    private var displayedSession: UUID?
     private var currentBody: TranslationBody?
     private var bodyHeight: CGFloat = 0
     private var allowsScrolling = false
@@ -206,18 +218,19 @@ final class TranslationBodyScrollView: NSScrollView {
         documentView = hosting
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    func updateBody(_ body: TranslationBody) {
-        guard body != currentBody else { return }
-        let reset = currentBody?.source != body.source || body.text.isEmpty ||
+    func updateBody(_ body: TranslationBody, sessionID: UUID) {
+        guard displayedSession != sessionID || body != currentBody else { return }
+        let reset = displayedSession != sessionID || body.text.isEmpty ||
             !(body.text.hasPrefix(currentBody?.text ?? ""))
+        displayedSession = sessionID
         currentBody = body; hosting.rootView = AnyView(body)
         hosting.layoutSubtreeIfNeeded()
         bodyHeight = ceil(hosting.fittingSize.height)
         layoutBody(reset: reset)
     }
-    func updateServices(_ body: ServiceResultsBody, source: String) {
-        let reset = servicesSource != source
-        servicesSource = source; currentBody = nil
+    func updateServices(_ body: ServiceResultsBody, sessionID: UUID) {
+        let reset = displayedSession != sessionID
+        displayedSession = sessionID; currentBody = nil
         hosting.rootView = AnyView(body)
         hosting.layoutSubtreeIfNeeded()
         bodyHeight = ceil(hosting.fittingSize.height)
@@ -249,8 +262,12 @@ final class TranslationBodyScrollView: NSScrollView {
 }
 
 struct TranslationDragArea: NSViewRepresentable {
+    var operation: TextOperation = .translation
     func makeNSView(context: Context) -> TranslationDragView { TranslationDragView() }
-    func updateNSView(_ view: TranslationDragView, context: Context) {}
+    func updateNSView(_ view: TranslationDragView, context: Context) {
+        let label = "拖动\(operation.resultName)窗口"
+        view.setAccessibilityLabel(label); view.toolTip = label
+    }
 }
 
 final class TranslationDragView: NSView {

@@ -46,6 +46,7 @@ final class ChatGPT: ObservableObject {
     private let defaults: UserDefaults
     private let session: URLSession
     private let vault: ChatGPTCredentialVault
+    private let diagnostic: ((String) -> Void)?
     private var temporaryModels: [ModelChoice] = []
     private var temporaryModelsAccountID = ""
     private var credentialRead: (UUID, Task<Credentials?, Error>)?
@@ -61,8 +62,8 @@ final class ChatGPT: ObservableObject {
     private let issuer = "https://auth.openai.com"
     private let resource = "https://api.openai.com/v1"
 
-    init(defaults: UserDefaults = .standard, session: URLSession = HTTP.session(), vault: ChatGPTCredentialVault = KeychainChatGPTCredentialVault()) {
-        self.defaults = defaults; self.session = session; self.vault = vault
+    init(defaults: UserDefaults = .standard, session: URLSession = HTTP.session(), vault: ChatGPTCredentialVault = KeychainChatGPTCredentialVault(), diagnostic: ((String) -> Void)? = nil) {
+        self.defaults = defaults; self.session = session; self.vault = vault; self.diagnostic = diagnostic
         if let data = defaults.data(forKey: "registrations"), let values = try? JSONDecoder().decode([Registration].self, from: data) { registrations = values }
         activeID = defaults.string(forKey: "activeRegistration") ?? ""
         modelID = defaults.string(forKey: "model.\(activeID)") ?? ""
@@ -194,7 +195,7 @@ final class ChatGPT: ObservableObject {
         accountError = ""
         if activeID == id { cancelLogin() }
         do { try vault.remove(id) }
-        catch { accountError = "无法删除账号：\(error.localizedDescription)"; return }
+        catch { accountError = "无法移除账号：\(error.localizedDescription)"; return }
         registrations.removeAll { $0.id == id }; persistRegistrations()
         defaults.removeObject(forKey: "model.\(id)")
         if defaults.string(forKey: "pendingClient") == id { defaults.removeObject(forKey: "pendingClient") }
@@ -356,20 +357,18 @@ final class ChatGPT: ObservableObject {
         temporaryModels = choices; temporaryModelsAccountID = client
         return choices
     }
-    static func translationBody(text: String, model: String, fastTranslation: Bool = false) throws -> Data {
+    static func translationBody(text: String, model: String, operation: TextOperation = .translation, instructions: String? = nil, thinkingEnabled: Bool = true) throws -> Data {
         var body: [String: Any] = ["model": model, "store": false, "stream": true,
-            "instructions": TranslationPrompt.text,
+            "instructions": instructions ?? TranslationPrompt.instructions(for: operation),
             "input": [["role": "user", "content": text]]]
-        if fastTranslation && FastTranslationCapability.supportsChatGPT(modelID: model) {
-            body["reasoning"] = ["effort": "none"]
-        }
+        try ThinkingCapability.parameter(chatGPTModel: model, enabled: thinkingEnabled)?.apply(to: &body)
         return try JSONSerialization.data(withJSONObject: body)
     }
-    func translate(_ raw: String, using requestedModel: String? = nil, accountID: String? = nil, diagnostic: ((String) -> Void)? = nil,
-                   fastTranslation: Bool = false, onThinking: @escaping @MainActor (TranslationThinkingEvidence) -> Void = { _ in },
+    func translate(_ raw: String, using requestedModel: String? = nil, accountID: String? = nil, operation: TextOperation = .translation, instructions: String? = nil, promptOptimization: Bool = false,
+                   thinkingEnabled: Bool = true, onThinking: @escaping @MainActor (TranslationThinkingEvidence) -> Void = { _ in },
                    onUpdate: @escaping @MainActor (String) -> Void) async throws -> String {
         try Task.checkCancellation()
-        let text = try TextPolicy.validate(raw)
+        let text = try promptOptimization ? PromptOptimization.validate(raw) : TextPolicy.validate(raw, operation: operation)
         let client = activeID; let run = generation
         guard accountID == nil || accountID == client else { throw QingyiError.message("ChatGPT 账号已切换，请重新选择当前账号的模型。") }
         let token = try await accessToken()
@@ -386,8 +385,8 @@ final class ChatGPT: ObservableObject {
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        request.httpBody = try Self.translationBody(text: text, model: selectedModel, fastTranslation: fastTranslation)
-        let parameter: FastTranslationParameter? = fastTranslation && FastTranslationCapability.supportsChatGPT(modelID: selectedModel) ? .reasoning : nil
+        request.httpBody = try Self.translationBody(text: text, model: selectedModel, operation: operation, instructions: instructions, thinkingEnabled: thinkingEnabled)
+        let parameter = ThinkingCapability.parameter(chatGPTModel: selectedModel, enabled: thinkingEnabled)
         let (bytes, response) = try await session.bytes(for: request)
         if let http = response as? HTTPURLResponse {
             diagnostic?("HTTP status: \(http.statusCode)")
@@ -403,7 +402,7 @@ final class ChatGPT: ObservableObject {
             if let http = response as? HTTPURLResponse, [400, 422].contains(http.statusCode) { try parameter?.checkRejection(body: body) }
             try HTTP.check(response, data: body); throw QingyiError.message("翻译请求失败。")
         }
-        var stream = TranslationDecoder(contentType: http.value(forHTTPHeaderField: "Content-Type") ?? "", fastParameter: parameter)
+        var stream = TranslationDecoder(contentType: http.value(forHTTPHeaderField: "Content-Type") ?? "", thinkingParameter: parameter)
         var wire = WireLines()
         var receivedBytes = false
         var lastUpdate = Date.distantPast
@@ -430,7 +429,7 @@ final class ChatGPT: ObservableObject {
             }
         }
         if !stream.completed, let tail = try wire.finish() { try acceptLine(tail) }
-        try FastTranslationFallbackReason.checkEmptyResponse(http, receivedBytes: receivedBytes)
+        try TranslationRequestError.checkEmptyResponse(http, receivedBytes: receivedBytes)
         let result = try stream.finish()
         try Task.checkCancellation()
         guard activeID == client, generation == run else { throw CancellationError() }

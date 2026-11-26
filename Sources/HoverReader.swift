@@ -12,7 +12,7 @@ enum HoverReadError: LocalizedError {
         switch self {
         case .unavailable: return "无法读取鼠标所在段落，请改用划词或复制文字后翻译。"
         case .protectedContent: return "此处为受保护内容，无法读取。"
-        case .tooLong: return "这段文字超过可读取范围或 12,000 字，请缩小选区后翻译。"
+        case .tooLong: return "无法完整读取这个段落。请选中其中一部分，再使用划词翻译。"
         case .timedOut: return "读取段落超时，请重试，或改用划词翻译。"
         }
     }

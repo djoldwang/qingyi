@@ -5,11 +5,11 @@ import Vision
 final class FixtureScreenshotCapture: ScreenshotCapturing {
     var image: CGImage?
     var error: Error?
-    var started = false
+    private(set) var captures = 0
     var cancelled = false
     var delay: UInt64 = 0
     func capture() async throws -> CGImage? {
-        started = true
+        captures += 1
         if delay > 0 { try await Task.sleep(nanoseconds: delay) }
         if let error = error { throw error }; return image
     }
@@ -81,6 +81,14 @@ extension QingyiTests {
         image.unlockFocus()
         return image.cgImage(forProposedRect: nil, context: nil, hints: nil)!
     }
+    static func screenshotScrollEvent(phase: CGScrollPhase? = nil, momentum: CGMomentumScrollPhase = .none) -> NSEvent {
+        let unit: CGScrollEventUnit = phase == nil && momentum == .none ? .line : .pixel
+        let wheel = CGEvent(scrollWheelEvent2Source: nil, units: unit, wheelCount: 1, wheel1: 5, wheel2: 0, wheel3: 0)!
+        if let phase { wheel.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase.rawValue)) }
+        wheel.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum.rawValue))
+        wheel.timestamp = CGEventTimestamp(ProcessInfo.processInfo.systemUptime * 1_000_000_000)
+        return NSEvent(cgEvent: wheel)!
+    }
     @MainActor static func screenshotTests() async {
         check("Screenshot OCR preserves paragraphs and list boundaries, joins prose and CJK") {
             let lines = [
@@ -119,9 +127,31 @@ extension QingyiTests {
             try expect(forwarded == 0 && cleared == 0 && monitor.screenshotSuspended)
             monitor.setScreenshotSuspended(false); monitor.event(release); monitor.schedule()
             try expect(forwarded == 0 && cleared == 0 && monitor.screenshotAwaitingFreshInput)
+            let shiftRelease = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: [.command, .control], timestamp: ProcessInfo.processInfo.systemUptime + 1,
+                                                windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 56)!
+            monitor.event(shiftRelease)
+            try expect(forwarded == 0 && monitor.screenshotAwaitingFreshInput, "Releasing Shift while other shortcut modifiers are down is still capture cleanup")
             let option = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: .option, timestamp: ProcessInfo.processInfo.systemUptime + 1, windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 58)!
             monitor.event(option)
             try expect(forwarded == 1 && !monitor.screenshotAwaitingFreshInput)
+        }
+        check("Screenshot suspension ignores ongoing scrolling and resumes on the first traditional mouse-wheel tick") {
+            let monitor = SelectionMonitor()
+            var scrolls = 0
+            monitor.onScroll = { scrolls += 1 }
+            monitor.setScreenshotSuspended(true)
+            monitor.setScreenshotSuspended(false)
+            let continued = screenshotScrollEvent(phase: .changed)
+            let momentum = screenshotScrollEvent(momentum: .continuous)
+            try expect(continued.phase == .changed && !momentum.momentumPhase.isEmpty, "Fixture must represent an ongoing gesture and its inertia")
+            for event in [continued, momentum] {
+                monitor.event(event)
+                try expect(monitor.screenshotAwaitingFreshInput && scrolls == 0, "Only a new scroll gesture should resume external input")
+            }
+            let wheel = screenshotScrollEvent()
+            try expect(wheel.phase.isEmpty && wheel.momentumPhase.isEmpty)
+            monitor.event(wheel)
+            try expect(!monitor.screenshotAwaitingFreshInput && scrolls == 1, "A traditional mouse emits individual ticks without phases")
         }
         let image = screenshotImage()
         await asyncCheck("Native capture reads output, deletes its directory, handles cancel, bad image and launch failure") {
@@ -177,7 +207,8 @@ extension QingyiTests {
                 Thread.sleep(forTimeInterval: 0.18)
                 return [ScreenshotOCRLine(text: "Late text", box: .zero)]
             })
-            do { _ = try await ocr.recognize(image); throw QingyiError.message("Expected timeout") } catch { try expect(error.localizedDescription.contains("超时")) }
+            do { _ = try await ocr.recognize(image); throw QingyiError.message("Expected timeout") }
+            catch { try expect(error.localizedDescription == "文字识别超时。点击“重试”可重新识别这张截图。如需缩小范围，请再次使用“截图翻译”并重新框选。") }
             do { _ = try await ocr.recognize(image); throw QingyiError.message("Expected busy rejection") } catch { try expect(error.localizedDescription.contains("仍在结束")) }
             try await Task.sleep(nanoseconds: 200_000_000)
             let task = Task { try await ocr.recognize(image) }
@@ -187,6 +218,83 @@ extension QingyiTests {
         await screenshotAppTests(image: image)
     }
     @MainActor static func screenshotAppTests(image: CGImage) async {
+        await asyncCheck("An unpinned screenshot survives focus and scrolling until every service finishes and still supports explicit dismissal") {
+            let domain = "qingyi-screenshot-window-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: domain)!
+            defer { defaults.removePersistentDomain(forName: domain); FixtureAPIProtocol.handle = nil }
+            let store = APIConfigurationStore(defaults: defaults, vault: MemoryAPIKeyVault())
+            var provider = APIProvider()
+            provider.name = "Window fixture"; provider.baseURL = "https://fixture.example/v1"
+            provider.models = [APIModel(id: "fixture", name: "fixture")]
+            try store.save(provider, replacementKey: "fixture-only")
+            try store.selectProvider(provider.id)
+            let translation = "截图译文"
+            FixtureAPIProtocol.handle = { _ in
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"截图译文\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                return (200, "text/event-stream", Data(body.utf8))
+            }
+            let capture = FixtureScreenshotCapture()
+            capture.image = image
+            let engine = TranslationEngine(chat: ChatGPT(defaults: defaults), configuration: store, client: CustomAPIClient(session: FixtureAPIProtocol.session()))
+            let app = AppDelegate(preferences: Preferences(defaults: defaults))
+            app.prepareScreenshotFixture(engine: engine, capture: capture, ocr: VisionScreenshotOCR())
+            app.services = BuiltinTranslationSettings(defaults: defaults, enabledByDefault: false)
+            app.services.youdao = true
+            var releaseSlowService: CheckedContinuation<Void, Never>?
+            app.builtinClient = BuiltinTranslationClient(youdao: { _ in
+                await withCheckedContinuation { releaseSlowService = $0 }
+                return BuiltinTranslationResult(text: "较慢服务的译文")
+            })
+            // Inject external events independently of where the real pointer happens to be.
+            app.monitor.isInternalInteraction = { _ in false }
+            defer { app.floating.onClose?(); releaseSlowService?.resume() }
+            func mouse(_ type: NSEvent.EventType) -> NSEvent {
+                NSEvent.mouseEvent(with: type, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                   windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+            }
+            func key(_ type: NSEvent.EventType, code: UInt16, flags: NSEvent.ModifierFlags = []) -> NSEvent {
+                NSEvent.keyEvent(with: type, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
+                                 windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)!
+            }
+            // Place the panel away from the pointer used by the synthetic outside click.
+            if let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) {
+                app.preferences.translationWindowPosition = NSEvent.mouseLocation.x < screen.frame.midX ? .upperRight : .upperLeft
+            }
+            for cancelWhileLoading in [false, true] {
+                app.translateScreenshot()
+                for _ in 0..<700 where releaseSlowService == nil || app.floating.state.text != translation { try await Task.sleep(for: .milliseconds(10)) }
+                try expect(releaseSlowService != nil && app.floating.state.text == translation && app.floating.state.loading)
+                try expect(app.floating.resultPanel.isVisible && !app.floating.state.pinned)
+                let session = app.floating.state.sessionID
+                app.monitor.event(mouse(.leftMouseUp))
+                app.monitor.event(mouse(.mouseMoved))
+                app.monitor.event(key(.flagsChanged, code: 56, flags: .shift))
+                app.monitor.applicationActivated(pid: 1)
+                app.monitor.schedule()  // The AX observer may report the restored selection.
+                app.monitor.event(key(.keyDown, code: 0))
+                app.monitor.event(screenshotScrollEvent(phase: .began))
+                app.monitor.event(screenshotScrollEvent())
+                app.monitor.event(screenshotScrollEvent(momentum: .continuous))
+                await Task.yield()
+                try expect(app.floating.resultPanel.isVisible && app.floating.state.sessionID == session && app.floating.state.loading,
+                           "Focus restoration, selection updates and scrolling must preserve the in-flight screenshot")
+                if cancelWhileLoading { app.monitor.event(key(.keyDown, code: 53)) }
+                releaseSlowService?.resume(); releaseSlowService = nil
+                if cancelWhileLoading {
+                    try await Task.sleep(for: .milliseconds(50))
+                    try expect(!app.floating.resultPanel.isVisible && app.floating.state.services.isEmpty, "Late service replies must not reopen the panel")
+                } else {
+                    for _ in 0..<200 where !app.floating.state.complete { try await Task.sleep(for: .milliseconds(10)) }
+                    app.monitor.event(mouse(.mouseMoved))
+                    app.monitor.applicationActivated(pid: 1)
+                    app.monitor.event(screenshotScrollEvent(momentum: .continuous))
+                    try expect(app.floating.resultPanel.isVisible && app.floating.state.sessionID == session && app.floating.state.complete)
+                    try expect(app.floating.state.services.first { $0.id == .youdao }?.result.text == "较慢服务的译文")
+                    app.monitor.event(mouse(.leftMouseDown))
+                }
+                try expect(!app.floating.resultPanel.isVisible, "The next outside click or Escape should still close the screenshot result")
+            }
+        }
         await asyncCheck("Screenshot entry skips Chinese silently, preserves pinned session, and retains error retry and English requests") {
             let domain = "qingyi-screenshot-app-" + UUID().uuidString
             let defaults = UserDefaults(suiteName: domain)!
@@ -212,13 +320,13 @@ extension QingyiTests {
             let app = AppDelegate(); let capture = FixtureScreenshotCapture(); let ocr = FixtureScreenshotOCR()
             app.prepareScreenshotFixture(engine: TranslationEngine(chat: ChatGPT(defaults: defaults), configuration: store, client: CustomAPIClient(session: FixtureAPIProtocol.session())), capture: capture, ocr: ocr)
             defer { app.floating.onClose?() }
-            app.floating.showResult(source: "Existing source"); app.floating.state.text = "Existing translation"
+            app.floating.showResult(); app.floating.state.text = "Existing translation"
             app.floating.state.loading = false; app.floating.state.pinned = true
             let previousID = app.floating.state.sessionID; let frame = app.floating.resultPanel.frame
             app.translateScreenshot()
             try expect(app.monitor.screenshotSuspended && !app.floating.resultPanel.isVisible)
             for _ in 0..<100 where app.screenshotActiveFixture { try await Task.sleep(nanoseconds: 10_000_000) }
-            try expect(capture.started && app.floating.resultPanel.isVisible && app.floating.state.pinned)
+            try expect(capture.captures == 1 && app.floating.resultPanel.isVisible && app.floating.state.pinned)
             try expect(app.floating.state.text == "Existing translation" && app.floating.state.sessionID == previousID && app.floating.resultPanel.frame == frame)
             try expect(!app.monitor.screenshotSuspended && bodies.isEmpty)
             capture.image = image
@@ -244,15 +352,19 @@ extension QingyiTests {
             for _ in 0..<100 where !app.floating.state.error { try await Task.sleep(nanoseconds: 10_000_000) }
             try expect(app.floating.state.error && ocr.calls == 1 && bodies.isEmpty)
             ocr.error = nil; ocr.text = String(repeating: "A complete screenshot sentence. ", count: 40)
+            let capturesBeforeRetry = capture.captures
             app.floating.onRetry?()
+            try expect(app.floating.state.loading && app.floating.state.loadingMessage == "正在识别截图中的文字…")
             for _ in 0..<150 where !app.floating.state.complete { try await Task.sleep(nanoseconds: 10_000_000) }
             try expect(app.floating.state.complete && ocr.calls == 2 && bodies.count == 1)
+            try expect(capture.captures == capturesBeforeRetry && app.floating.state.loadingMessage == nil)
             try expect(String(data: bodies[0], encoding: .utf8)?.contains(TextPolicy.clean(ocr.text)) == true, "Full OCR source must reach the provider")
             app.floating.state.pinned = true
             let translatedID = app.floating.state.sessionID; let translatedText = app.floating.state.text
             let translatedFrame = app.floating.resultPanel.frame; let originalEnglish = TextPolicy.clean(ocr.text)
             ocr.text = chinese[1]; app.translateScreenshot()
             for _ in 0..<100 where app.screenshotActiveFixture { try await Task.sleep(nanoseconds: 10_000_000) }
+            try expect(capture.captures == capturesBeforeRetry + 1)
             try expect(app.floating.resultPanel.isVisible && app.floating.state.pinned && app.floating.state.complete && !app.floating.state.error)
             try expect(app.floating.state.sessionID == translatedID && app.floating.state.text == translatedText && app.floating.resultPanel.frame == translatedFrame && bodies.count == 1)
             app.floating.onRetry?()

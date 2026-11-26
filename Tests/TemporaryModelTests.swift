@@ -50,7 +50,87 @@ final class AuthorizedChatGPTVault: ChatGPTCredentialVault {
     func remove(_ id: String) throws { }
 }
 
+private final class ToolbarSourceEditor: NSTextView {
+    let testPasteboard = NSPasteboard.withUniqueName()
+    private(set) var copied = 0
+    override func copy(_ sender: Any?) {
+        copied += 1
+        testPasteboard.declareTypes([.string], owner: nil)
+        testPasteboard.setString((string as NSString).substring(with: selectedRange()), forType: .string)
+    }
+}
+
 extension QingyiTests {
+    @MainActor static func selectionToolbarFocusTests() {
+        check("Automatically displayed actions leave Copy and Shift-selection in the source editor and only execute the clicked operation") {
+            let editor = ToolbarSourceEditor(frame: NSRect(x: 0, y: 0, width: 280, height: 90))
+            let source = NSPanel(contentRect: editor.frame, styleMask: [.titled, .nonactivatingPanel], backing: .buffered, defer: false)
+            source.isReleasedWhenClosed = false
+            source.contentView = editor
+            let popup = AIActionPopup()
+            defer { popup.hide(); source.close(); editor.testPasteboard.releaseGlobally() }
+            editor.string = "AlphaBeta sample"
+            source.makeKeyAndOrderFront(nil)
+            try expect(source.makeFirstResponder(editor))
+            editor.setSelectedRange(NSRange(location: 0, length: 5))
+            let custom = TextOperation.custom(AIAction(name: "翻译", prompt: "Use this custom prompt"))
+            var chosen: [TextOperation] = []
+            popup.onSelect = { chosen.append($0) }
+            popup.show(operations: [.translation, custom], position: .lowerRight, presentation: .automatic)
+            try expect(popup.panel.isVisible && !popup.panel.canBecomeKey && !popup.panel.isKeyWindow)
+            try expect(source.isKeyWindow && source.firstResponder === editor, "Automatic display must keep the source editor focused")
+            try expect(!popup.key(36) && !popup.key(124) && !popup.key(53))
+            popup.state.hover(1, inside: true)
+            try expect(chosen.isEmpty)
+
+            let menu = NSMenu()
+            let copy = menu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+            copy.keyEquivalentModifierMask = .command
+            @MainActor func keyEvent(_ key: UInt16, _ characters: String, _ flags: NSEvent.ModifierFlags) -> NSEvent {
+                NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
+                                 windowNumber: source.windowNumber, context: nil, characters: characters,
+                                 charactersIgnoringModifiers: characters, isARepeat: false, keyCode: key)!
+            }
+            let copyEvent = keyEvent(8, "c", .command)
+            try expect(editor.selectedRange() == NSRange(location: 0, length: 5))
+            try expect((NSApp.target(forAction: #selector(NSText.copy(_:)), to: nil, from: copy) as? NSTextView) === editor,
+                       "The source editor must own the Copy responder after the toolbar appears")
+            try expect(menu.performKeyEquivalent(with: copyEvent))
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+            try expect(editor.copied == 1, "The source editor must receive the menu shortcut")
+            try expect(editor.testPasteboard.string(forType: .string) == "Alpha", "Command-C should copy the selected Alpha into the source editor's pasteboard")
+            source.sendEvent(keyEvent(124, "\u{f703}", [.shift, .function, .numericPad]))
+            try expect(editor.selectedRange() == NSRange(location: 0, length: 6))
+            try expect(menu.performKeyEquivalent(with: copyEvent))
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+            try expect(editor.testPasteboard.string(forType: .string) == "AlphaB")
+            try expect(chosen.isEmpty && source.isKeyWindow && popup.panel.isVisible)
+
+            // Dispatch the first click to the real SwiftUI button in the visible non-key panel.
+            // Queue mouse-up first for AppKit controls that enter a tracking loop on mouse-down.
+            let center = NSPoint(x: popup.panel.frame.width - 28, y: popup.panel.frame.height / 2)
+            @MainActor func mouseEvent(_ type: NSEvent.EventType) -> NSEvent {
+                NSEvent.mouseEvent(with: type, location: center, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                   windowNumber: popup.panel.windowNumber, context: nil, eventNumber: 0,
+                                   clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)!
+            }
+            popup.panel.contentView?.layoutSubtreeIfNeeded()
+            let press = mouseEvent(.leftMouseDown)
+            NSApp.postEvent(mouseEvent(.leftMouseUp), atStart: true)
+            popup.panel.sendEvent(press)
+            if let release = NSApp.nextEvent(matching: .leftMouseUp, until: Date(), inMode: .default, dequeue: true) {
+                popup.panel.sendEvent(release)
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            try expect(chosen == [custom])
+            popup.show(operations: [.translation], position: .lowerRight, presentation: .automatic)
+            popup.state.choose(custom)
+            try expect(chosen == [custom], "An item removed from the displayed toolbar cannot run")
+            popup.state.choose(.translation)
+            try expect(chosen == [custom, .translation])
+        }
+    }
+
     static func dataOfRequest(_ request: URLRequest) throws -> Data {
         var data = request.httpBody ?? Data()
         if data.isEmpty, let stream = request.httpBodyStream {
@@ -69,7 +149,119 @@ extension QingyiTests {
     static func bodyOfRequest(_ request: URLRequest) throws -> [String: Any] {
         try JSONSerialization.jsonObject(with: dataOfRequest(request)) as! [String: Any]
     }
+    @MainActor private static func resultActionButtonTests() async {
+        await asyncCheck("Native result action buttons fit the available width and dispatch the selected action with its original session") {
+            let controller = FloatingController()
+            controller.onClose = { [weak controller] in controller?.hide() }
+            controller.showResult(preview: true)
+            defer { controller.hide() }
+
+            let host = NSView(frame: controller.resultPanel.contentView!.bounds)
+            controller.resultPanel.contentView = host
+            let row = ResultActionButtonRow()
+            host.addSubview(row)
+            @MainActor func layout(_ width: CGFloat) -> [NSButton] {
+                row.frame = NSRect(x: 0, y: 0, width: width, height: 24)
+                row.needsLayout = true
+                row.layoutSubtreeIfNeeded()
+                return row.subviews.compactMap { $0 as? NSButton }
+                    .filter { !$0.isHidden }.sorted { $0.frame.minX < $1.frame.minX }
+            }
+            let origin = UUID()
+            let longName = String(repeating: "保留完整动作名称", count: 10)
+            let long = TextOperation.custom(AIAction(name: longName, prompt: "long"))
+            let first = TextOperation.custom(AIAction(name: "同名", prompt: "first"))
+            let second = TextOperation.custom(AIAction(name: "同名", prompt: "second"))
+            let actions = [long, first, second, TextOperation.polishing]
+            var selected: [(TextOperation, UUID)] = []
+            row.select = { selected.append(($0, $1)) }
+
+            row.update([], session: origin)
+            try expect(layout(160).isEmpty)
+            row.update([long], session: origin)
+            let single = layout(120)
+            let actionHelp = "用“\(longName)”处理最初选中的文字。"
+            try expect(single.count == 1 && single[0].title == longName && single[0].toolTip == actionHelp)
+            try expect(single[0].accessibilityHelp() == actionHelp)
+            try expect(single[0].frame.width == 120 && single[0].frame.maxX <= row.bounds.width)
+            single[0].performClick(nil)
+            try expect(selected.count == 1 && selected[0].0 == long && selected[0].1 == origin)
+
+            row.update([first, second], session: origin)
+            let twins = layout(280)
+            try expect(twins.map(\.title) == ["同名", "同名"] && twins[0].frame.maxX < twins[1].frame.minX)
+            twins[1].performClick(nil)
+            try expect(selected.count == 2 && selected[1].0 == second && selected[1].1 == origin)
+
+            row.update(actions, session: origin)
+            let compact = layout(150)
+            try expect(compact.map(\.title) == [longName, "更多"])
+            try expect(compact[0].frame.maxX < compact[1].frame.minX && compact[1].frame.maxX <= row.bounds.width)
+            try expect(compact[0].frame.width < compact[0].intrinsicContentSize.width)
+            let more = compact[1]
+            let narrow = layout(ceil(more.intrinsicContentSize.width))
+            try expect(narrow == [more] && more.frame.maxX <= row.bounds.width)
+            _ = layout(150)
+
+            // AppKit runs menu tracking synchronously in its own run-loop mode.
+            // Schedule interactions from the tracking callback, after the button opens.
+            @MainActor func withOpenMenu(_ interaction: @escaping @MainActor (NSMenu) -> Void) throws {
+                var states: [Bool] = []
+                var visited = false
+                var timedOut = false
+                var timers: [Timer] = []
+                row.tracking = { tracking in
+                    states.append(tracking)
+                    controller.handleModelMenuTracking(tracking)
+                    guard tracking else { return }
+                    let action = Timer(fire: Date().addingTimeInterval(0.12), interval: 0, repeats: false) { _ in
+                        MainActor.assumeIsolated {
+                            guard let menu = ResultActionButtonRow.presentedMenu else { return }
+                            visited = true
+                            interaction(menu)
+                        }
+                    }
+                    let timeout = Timer(fire: Date().addingTimeInterval(1.5), interval: 0, repeats: false) { _ in
+                        MainActor.assumeIsolated {
+                            timedOut = true
+                            ResultActionButtonRow.presentedMenu?.cancelTrackingWithoutAnimation()
+                        }
+                    }
+                    timers = [action, timeout]
+                    for timer in timers {
+                        RunLoop.main.add(timer, forMode: .eventTracking)
+                        RunLoop.main.add(timer, forMode: .common)
+                    }
+                }
+                defer { timers.forEach { $0.invalidate() }; row.tracking = nil }
+                more.performClick(nil)
+                try expect(visited && !timedOut && states == [true, false], "Menu should open, process the interaction, then end tracking")
+                try expect(ResultActionButtonRow.presentedMenu == nil && !controller.modelMenuTracking && controller.resultPanel.isVisible)
+            }
+
+            var titles: [String] = []
+            try withOpenMenu { menu in
+                titles = menu.items.map(\.title)
+                if menu.items.count == 3 { menu.performActionForItem(at: 1) }
+                else { menu.cancelTrackingWithoutAnimation() }
+            }
+            try expect(titles == ["同名", "同名", "润色"])
+            // The selection callback is delivered after the native menu unwinds.
+            // The button row may already have been rebound to a new result by then.
+            row.update(actions, session: UUID())
+            _ = layout(150)
+            try await waitForPolishing { selected.count == 3 }
+            try expect(selected[2].0 == second && selected[2].1 == origin)
+
+            try withOpenMenu { _ in controller.resultPanel.cancelOperation(nil) }
+            try withOpenMenu { menu in menu.cancelTrackingWithoutAnimation() }
+            try await Task.sleep(for: .milliseconds(30))
+            try expect(selected.count == 3 && controller.resultPanel.isVisible, "Esc and native cancellation keep the result without dispatching an action")
+        }
+    }
+
     @MainActor static func temporaryModelTests() async {
+        await resultActionButtonTests()
         check("Translation window defaults to upper-right and saves its own placement without changing button placement") {
             let domain = "qingyi-window-placement-" + UUID().uuidString
             let defaults = UserDefaults(suiteName: domain)!
@@ -103,10 +295,37 @@ extension QingyiTests {
                 try expect(button.x == screen.maxX - 48 && button.y == screen.maxY - 48)
             }
         }
+        check("Upper-left placement persists, mirrors upper-right across screens and stays anchored while results grow") {
+            let domain = "qingyi-upper-left-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: domain)!
+            defer { defaults.removePersistentDomain(forName: domain) }
+            let preferences = Preferences(defaults: defaults)
+            preferences.translationWindowPosition = .upperLeft
+            try expect(Preferences(defaults: defaults).translationWindowPosition == .upperLeft)
+            try expect(TranslationWindowPosition.upperLeft.title == "屏幕左上角")
+            for screen in [NSRect(x: 0, y: 25, width: 1440, height: 875), NSRect(x: -1920, y: -200, width: 1920, height: 1080)] {
+                for height in [128.0, 260, 20_000] {
+                    let left = TranslationWindowLayout.frame(contentHeight: height, position: .upperLeft, pointer: .zero, screen: screen)
+                    let right = TranslationWindowLayout.frame(contentHeight: height, position: .upperRight, pointer: .zero, screen: screen)
+                    try expect(left.minX == screen.minX && left.maxY == screen.maxY && left.width == right.width && left.height == right.height)
+                    try expect(screen.contains(left))
+                }
+                let manual = NSPoint(x: screen.minX + 60, y: screen.maxY - 70)
+                let moved = TranslationWindowLayout.frame(contentHeight: 200, position: .upperLeft, pointer: .zero, screen: screen, manualTopLeft: manual)
+                try expect(moved.minX == manual.x && moved.maxY == manual.y)
+            }
+            let controller = FloatingController(); defer { controller.hide() }
+            controller.showResult(preview: true, position: .upperLeft)
+            let original = controller.resultPanel.frame
+            for text in ["", "你好。", String(repeating: "长内容保持左上角锚点。", count: 500)] {
+                controller.state.text = text; controller.fitContent()
+                try expect(controller.resultPanel.frame.minX == original.minX && controller.resultPanel.frame.maxY == original.maxY)
+            }
+        }
         check("Translation height grows with content and caps at available screen height for internal scrolling") {
-            let short = TranslationWindowLayout.contentHeight(source: "Hello", text: "你好。")
-            let medium = TranslationWindowLayout.contentHeight(source: "Hello", text: String(repeating: "较长的一段中文译文。", count: 30))
-            let long = TranslationWindowLayout.contentHeight(source: "Hello", text: String(repeating: "较长的一段中文译文。", count: 1000))
+            let short = TranslationWindowLayout.contentHeight(text: "你好。")
+            let medium = TranslationWindowLayout.contentHeight(text: String(repeating: "较长的一段中文译文。", count: 30))
+            let long = TranslationWindowLayout.contentHeight(text: String(repeating: "较长的一段中文译文。", count: 1000))
             try expect(short >= 128 && short < 160 && medium > short && long > medium)
             let screen = NSRect(x: 0, y: 0, width: 1440, height: 900)
             let frame = TranslationWindowLayout.frame(contentHeight: long, position: .upperRight, pointer: .zero, screen: screen)
@@ -114,7 +333,7 @@ extension QingyiTests {
         }
         check("Upper-right panel stays flush while loading and growing, with no placement preference changes") {
             let controller = FloatingController()
-            controller.showResult(source: "Hello", preview: true)
+            controller.showResult(preview: true)
             defer { controller.hide() }
             let initial = controller.resultPanel.frame
             for text in ["", "你好。", String(repeating: "用于验证贴边和内部滚动的长译文。", count: 1000)] {
@@ -126,11 +345,11 @@ extension QingyiTests {
         }
         check("Pinned window keeps its result while another selection button appears and resets on explicit close") {
             let controller = FloatingController()
-            controller.showResult(source: "Hello", preview: true)
+            controller.showResult(preview: true)
             controller.state.text = "译文"; controller.state.pinned = true
             controller.showButton(position: .lowerLeft, preserveResult: true)
             try expect(controller.state.text == "译文" && controller.state.pinned)
-            controller.showResult(source: "New source", keepPosition: false)
+            controller.showResult(keepPosition: false)
             try expect(controller.state.pinned)
             controller.onClose = { [weak controller] in controller?.hide() }
             controller.resultPanel.cancelOperation(nil)
@@ -462,7 +681,7 @@ extension QingyiTests {
         check("Closing the translation panel uses session cleanup, while preview model switching is disabled") {
             let controller = FloatingController()
             var closed = false; controller.onClose = { closed = true }
-            controller.showResult(source: "Example", preview: true)
+            controller.showResult(preview: true)
             try expect(!controller.state.modelSelectionEnabled)
             controller.resultPanel.cancelOperation(nil)
             try expect(closed)

@@ -11,8 +11,8 @@ struct QingyiTests {
         do { try body(); passed += 1; print("PASS \(name)") }
         catch { failed += 1; print("FAIL \(name): \(error)") }
     }
-    static func expect(_ condition: @autoclosure () throws -> Bool, _ message: String = "assertion failed") throws {
-        if try !condition() { throw QingyiError.message(message) }
+    static func expect(_ condition: @autoclosure () throws -> Bool, _ message: String = "assertion failed", file: StaticString = #filePath, line: UInt = #line) throws {
+        if try !condition() { throw QingyiError.message("\(message) (\(file):\(line))") }
     }
     static func rejects(_ body: () throws -> Void) throws {
         do { try body() } catch { return }
@@ -45,10 +45,10 @@ struct QingyiTests {
             return
         }
         if CommandLine.arguments.contains("--native-screenshot") { runNativeScreenshotFixture(); return }
-        if CommandLine.arguments.contains("--native-settings") || Bundle.main.bundleIdentifier == "com.laowang.qingyi.settings-tests" {
+        if CommandLine.arguments.contains("--native-settings") || Bundle.main.bundleIdentifier?.hasPrefix("com.laowang.qingyi.settings-tests") == true {
             runNativeSettingsFixture(); return
         }
-        if CommandLine.arguments.contains("--native-model-menu") || Bundle.main.bundleIdentifier?.hasPrefix("com.laowang.qingyi.model-menu-tests") == true {
+        if CommandLine.arguments.contains("--native-polishing") || CommandLine.arguments.contains("--native-model-menu") || Bundle.main.bundleIdentifier?.hasPrefix("com.laowang.qingyi.model-menu-tests") == true {
             runNativeModelMenuFixture(); return
         }
         // Vision and AppKit require a real main run loop, including in CLI tests.
@@ -57,6 +57,45 @@ struct QingyiTests {
         NSApplication.shared.run()
     }
     @MainActor static func runTests() async {
+        if CommandLine.arguments.contains("--prompt-undo-persistence") {
+            promptUndoPersistencePhase(); return
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--ai-action-ui-snapshots"), CommandLine.arguments.count > index + 1 {
+            do { try renderAIActionUI(to: CommandLine.arguments[index + 1]); print("PASS custom AI action UI snapshots") }
+            catch { print("FAIL action UI snapshots: \(error)"); exit(1) }
+            return
+        }
+        if let index = CommandLine.arguments.firstIndex(of: "--polishing-ui-snapshots"), CommandLine.arguments.count > index + 1 {
+            do { try renderPolishingUI(to: CommandLine.arguments[index + 1]); print("PASS polishing UI snapshots rendered with fixture data") }
+            catch { print("FAIL polishing UI snapshots: \(error)"); exit(1) }
+            return
+        }
+        if CommandLine.arguments.contains("--thinking-tests") {
+            await translationThinkingTests()
+            await fastTranslationFallbackTests()
+            print("\(passed) passed, \(failed) failed"); exit(failed == 0 ? 0 : 1)
+        }
+        if CommandLine.arguments.contains("--polishing-tests") {
+            await polishingTests()
+            print("\(passed) passed, \(failed) failed"); exit(failed == 0 ? 0 : 1)
+        }
+        if CommandLine.arguments.contains("--interaction-tests") {
+            hoverTests()
+            await aiActionTests()
+            print("\(passed) passed, \(failed) failed"); exit(failed == 0 ? 0 : 1)
+        }
+        if CommandLine.arguments.contains("--settings-tests") {
+            settingsTests()
+            print("\(passed) passed, \(failed) failed"); exit(failed == 0 ? 0 : 1)
+        }
+        if CommandLine.arguments.contains("--ai-action-tests") {
+            await aiActionTests()
+            print("\(passed) passed, \(failed) failed"); exit(failed == 0 ? 0 : 1)
+        }
+        if CommandLine.arguments.contains("--ai-text-settings-tests") {
+            await aiTextSettingsTests()
+            print("\(passed) passed, \(failed) failed"); exit(failed == 0 ? 0 : 1)
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--callback-page-previews"), CommandLine.arguments.count > index + 1 {
             do {
                 let directory = URL(fileURLWithPath: CommandLine.arguments[index + 1], isDirectory: true)
@@ -71,7 +110,8 @@ struct QingyiTests {
         if let index = CommandLine.arguments.firstIndex(of: "--builtin-ui-snapshots"), CommandLine.arguments.count > index + 1 {
             do {
                 let recognized = try await VisionScreenshotOCR().recognize(screenshotImage())
-                try renderBuiltinUI(to: CommandLine.arguments[index + 1], recognized: recognized); print("PASS native service card snapshots") }
+                try expect(recognized.contains("Small steps"))
+                try renderBuiltinUI(to: CommandLine.arguments[index + 1]); print("PASS native service card snapshots") }
             catch { print("FAIL \(error)"); exit(1) }
             return
         }
@@ -86,7 +126,16 @@ struct QingyiTests {
             print("\(passed) passed, \(failed) failed"); exit(failed == 0 ? 0 : 1)
         }
         if CommandLine.arguments.contains("--screenshot-app-tests") {
-            await screenshotAppTests(image: screenshotImage())
+            if let index = CommandLine.arguments.firstIndex(of: "--screenshot-input") {
+                guard CommandLine.arguments.indices.contains(index + 1),
+                      let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: CommandLine.arguments[index + 1]) as CFURL, nil),
+                      let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                    print("FAIL unable to load screenshot fixture"); exit(1)
+                }
+                await screenshotAppTests(image: image)
+            } else {
+                await screenshotAppTests(image: screenshotImage())
+            }
             print("\(passed) passed, \(failed) failed"); exit(failed == 0 ? 0 : 1)
         }
         if CommandLine.arguments.contains("--screenshot-tests") {
@@ -106,6 +155,9 @@ struct QingyiTests {
         await screenshotTests()
         settingsTests()
         await releaseTests()
+        await polishingTests()
+        await aiTextSettingsTests()
+        await aiActionTests()
         check("RFC 7636 PKCE vector") {
             try expect(pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
         }
@@ -256,12 +308,13 @@ struct QingyiTests {
             let point = FloatingController.clamped(NSPoint(x: -20, y: -500), size: NSSize(width: 420, height: 340), screen: screen)
             try expect(point.x == -430 && point.y == -190)
         }
-        check("Selection button is entirely in each chosen mouse quadrant with a 12 pt gap") {
+        check("Selection entry uses each of six mouse placements with a 12 pt gap") {
             let mouse = NSPoint(x: 100, y: 200)
             let size = NSSize(width: 38, height: 38)
             let expected: [ButtonPosition: NSPoint] = [
                 .lowerLeft: NSPoint(x: 50, y: 150), .lowerRight: NSPoint(x: 112, y: 150),
-                .upperLeft: NSPoint(x: 50, y: 212), .upperRight: NSPoint(x: 112, y: 212)
+                .upperLeft: NSPoint(x: 50, y: 212), .upperRight: NSPoint(x: 112, y: 212),
+                .above: NSPoint(x: 81, y: 212), .below: NSPoint(x: 81, y: 150)
             ]
             for position in ButtonPosition.allCases {
                 try expect(position.origin(relativeTo: mouse, size: size) == expected[position])
@@ -269,34 +322,91 @@ struct QingyiTests {
             // The result panel keeps its existing lower-right anchor independently.
             try expect(FloatingController.belowPointer(mouse, size: NSSize(width: 420, height: 340)) == NSPoint(x: 112, y: -152))
         }
-        check("Selection button remains visible at all corners including negative-coordinate displays") {
-            let size = NSSize(width: 38, height: 38)
+        check("Selection entries stay on screen and clear the pointer at display edges") {
             for screen in [NSRect(x: 0, y: 25, width: 1440, height: 875), NSRect(x: -1920, y: -200, width: 1920, height: 1080)] {
                 let usable = screen.insetBy(dx: 10, dy: 10)
-                for x in [screen.minX, screen.maxX] {
-                    for y in [screen.minY, screen.maxY] {
-                        for position in ButtonPosition.allCases {
-                            let origin = position.origin(relativeTo: NSPoint(x: x, y: y), size: size)
-                            let clamped = FloatingController.clamped(origin, size: size, screen: screen)
-                            try expect(usable.contains(NSRect(origin: clamped, size: size)))
+                for size in [NSSize(width: 38, height: 38), NSSize(width: 820, height: 32)] {
+                    for x in [usable.minX, screen.midX, usable.maxX] {
+                        for y in [usable.minY, screen.midY, usable.maxY] {
+                            let mouse = NSPoint(x: x, y: y)
+                            for position in ButtonPosition.allCases {
+                                let origin = position.placedOrigin(relativeTo: mouse, size: size, screen: screen)
+                                let rect = NSRect(origin: origin, size: size)
+                                try expect(usable.contains(rect) && (rect.minY >= y + 12 || rect.maxY <= y - 12))
+                                if x == screen.midX && (position == .above || position == .below) {
+                                    try expect(rect.midX == x)
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        check("Selection button defaults left-down and preserves each saved choice on reload") {
+        check("The compact button defaults to lower-left and the action bar below the pointer in either mode") {
             let domain = "com.laowang.qingyi.tests.position." + UUID().uuidString
             let defaults = UserDefaults(suiteName: domain)!
             defer { defaults.removePersistentDomain(forName: domain) }
-            try expect(Preferences(defaults: defaults).buttonPosition == .lowerLeft)
             let preferences = Preferences(defaults: defaults)
-            for position in ButtonPosition.allCases {
-                preferences.buttonPosition = position
-                try expect(defaults.string(forKey: "selectionButtonPosition") == position.rawValue)
-                try expect(Preferences(defaults: defaults).buttonPosition == position)
+            try expect(preferences.selectionMode == .compact)
+            try expect(preferences.buttonPosition == .lowerLeft && preferences.actionBarPosition == .below)
+            preferences.selectionMode = .toolbar
+            let reopened = Preferences(defaults: defaults)
+            try expect(reopened.selectionMode == .toolbar)
+            try expect(reopened.buttonPosition == .lowerLeft && reopened.actionBarPosition == .below)
+        }
+        check("The button and the action bar remember all six positions independently of mode and restart") {
+            let domain = "com.laowang.qingyi.tests.position." + UUID().uuidString
+            let defaults = UserDefaults(suiteName: domain)!
+            defer { defaults.removePersistentDomain(forName: domain) }
+            var preferences = Preferences(defaults: defaults)
+            let positions = ButtonPosition.allCases
+            for (compact, toolbar) in zip(positions, positions.reversed()) {
+                preferences.buttonPosition = compact
+                preferences.actionBarPosition = toolbar
+                preferences.selectionMode = .toolbar
+                preferences = Preferences(defaults: defaults)
+                try expect(preferences.selectionMode == .toolbar)
+                try expect(preferences.buttonPosition == compact && preferences.actionBarPosition == toolbar)
+                preferences.selectionMode = .compact
+                try expect(preferences.buttonPosition == compact && preferences.actionBarPosition == toolbar)
             }
-            defaults.set("unknown-position", forKey: "selectionButtonPosition")
-            try expect(Preferences(defaults: defaults).buttonPosition == .lowerLeft)
+        }
+        check("A legacy position belongs to the original selection mode even after switching modes before restart") {
+            let cases: [(savedMode: String?, mode: SelectionMode, position: ButtonPosition)] = [
+                (nil, .compact, .upperRight), ("compact", .compact, .above),
+                ("toolbar", .toolbar, .upperLeft), ("toolbar", .toolbar, .lowerLeft),
+                ("unknown-mode", .compact, .lowerRight)
+            ]
+            for item in cases {
+                let domain = "com.laowang.qingyi.tests.position." + UUID().uuidString
+                let defaults = UserDefaults(suiteName: domain)!
+                defer { defaults.removePersistentDomain(forName: domain) }
+                if let savedMode = item.savedMode { defaults.set(savedMode, forKey: "selectionMode") }
+                defaults.set(item.position.rawValue, forKey: "selectionButtonPosition")
+                let upgraded = Preferences(defaults: defaults)
+                let button: ButtonPosition = item.mode == .compact ? item.position : .lowerLeft
+                let actionBar: ButtonPosition = item.mode == .toolbar ? item.position : .below
+                try expect(upgraded.selectionMode == item.mode)
+                try expect(upgraded.buttonPosition == button && upgraded.actionBarPosition == actionBar)
+                let otherMode: SelectionMode = item.mode == .compact ? .toolbar : .compact
+                upgraded.selectionMode = otherMode
+                let reopened = Preferences(defaults: defaults)
+                try expect(reopened.selectionMode == otherMode)
+                try expect(reopened.buttonPosition == button && reopened.actionBarPosition == actionBar)
+                reopened.selectionMode = item.mode
+                try expect(reopened.buttonPosition == button && reopened.actionBarPosition == actionBar)
+            }
+        }
+        check("Invalid legacy positions leave both controls at their own defaults") {
+            for mode in SelectionMode.allCases {
+                let domain = "com.laowang.qingyi.tests.position." + UUID().uuidString
+                let defaults = UserDefaults(suiteName: domain)!
+                defer { defaults.removePersistentDomain(forName: domain) }
+                defaults.set(mode.rawValue, forKey: "selectionMode")
+                defaults.set("unknown-position", forKey: "selectionButtonPosition")
+                let preferences = Preferences(defaults: defaults)
+                try expect(preferences.buttonPosition == .lowerLeft && preferences.actionBarPosition == .below)
+            }
         }
         check("Missing runtime bundle and executable are rejected before OAuth") {
             try expect(!AppRuntime.filesPresent(bundle: nil, executable: nil))

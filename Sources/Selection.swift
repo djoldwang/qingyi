@@ -99,7 +99,7 @@ enum SelectionReader {
                 if let snapshot = inspect(node) { return snapshot }
                 let role = value(node, kAXRoleAttribute) as? String ?? ""
                 let subrole = value(node, kAXSubroleAttribute) as? String ?? ""
-                if role == "AXSecureTextField" || subrole == "AXSecureTextField" { return nil }
+                if role == "AXSecureTextField" || subrole == "AXSecureTextField" || value(node, "AXProtectedContent") as? Bool == true { return nil }
                 current = self.element(value(node, kAXParentAttribute))
             }
         }
@@ -113,7 +113,7 @@ enum SelectionReader {
                 let node = queue[index]; index += 1
                 AXUIElementSetMessagingTimeout(node, 0.05)
                 let role = value(node, kAXRoleAttribute) as? String ?? ""
-                guard containers.contains(role) else { continue }
+                guard containers.contains(role), value(node, "AXProtectedContent") as? Bool != true else { continue }
                 if role == "AXWebArea", let selected = inspect(node) { return selected }
                 if role != "AXWebArea", let children = value(node, kAXChildrenAttribute) as? [AXUIElement] { queue.append(contentsOf: children.prefix(100 - min(queue.count, 100))) }
             }
@@ -123,9 +123,21 @@ enum SelectionReader {
 }
 
 final class SelectionMonitor {
-    static var isLeftMouseDown: Bool { NSEvent.pressedMouseButtons & 1 != 0 }
+    #if QINGYI_TESTING
+    static var leftMouseDownOverride: Bool?
+    #endif
+    static var isLeftMouseDown: Bool {
+        #if QINGYI_TESTING
+        if let value = leftMouseDownOverride { return value }
+        #endif
+        return NSEvent.pressedMouseButtons & 1 != 0
+    }
     private(set) var screenshotSuspended = false
     private(set) var screenshotAwaitingFreshInput = false
+    var screenshotWorkPending: (() -> Bool)?
+    var defersSelectionForScreenshot: Bool {
+        screenshotSuspended || screenshotAwaitingFreshInput || screenshotWorkPending?() == true
+    }
     func setScreenshotSuspended(_ value: Bool) {
         screenshotSuspended = value; invalidateInternalRead()
         if !value {
@@ -135,7 +147,10 @@ final class SelectionMonitor {
         }
     }
     var onSelection: ((SelectionSnapshot?) -> Void)?
+    var onSelectionInvalidated: (() -> Void)?
     var onExternalEvent: ((NSEvent) -> Bool)?
+    var onTrackedEvent: ((NSEvent) -> Void)?
+    var onLocalEvent: ((NSEvent) -> Void)?
     var onContextChanged: (() -> Void)?
     var onInternalEvent: (() -> Void)?
     private(set) var hoverOwnsSelection = false
@@ -148,6 +163,7 @@ final class SelectionMonitor {
     var onCancel: (() -> Void)?
     var onMenuCancel: (() -> Void)?
     var isInternalInteraction: ((NSPoint) -> Bool)?
+    var isOverAutomaticToolbar: ((NSPoint) -> Bool)?
     var enabled = true
     private(set) var modelMenuTracking = false
     private var interactionEpoch = 0
@@ -178,6 +194,8 @@ final class SelectionMonitor {
         global = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] in self?.event($0) }
         local = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged, .leftMouseDown]) { [weak self] event in
             if self?.screenshotSuspended == true { return event }
+            self?.onTrackedEvent?(event)
+            self?.onLocalEvent?(event)
             self?.onInternalEvent?()
             if let self = self, event.type == .keyDown, event.keyCode == 53, self.modelMenuTracking {
                 self.onMenuCancel?(); return nil
@@ -187,14 +205,17 @@ final class SelectionMonitor {
             return event
         }
         activation = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
-            self?.invalidateInternalRead()
-            self?.onContextChanged?()
             let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            if self?.modelMenuTracking == false, self?.awaitingExternalInputAfterMenu == false, self?.screenshotSuspended == false, self?.screenshotAwaitingFreshInput == false,
-               app?.processIdentifier != getpid() { self?.onSelection?(nil) }
+            self?.applicationActivated(pid: app?.processIdentifier)
             self?.attachObserver()
         }
         attachObserver()
+    }
+    func applicationActivated(pid: pid_t?) {
+        invalidateInternalRead()
+        onContextChanged?()
+        if !modelMenuTracking, !awaitingExternalInputAfterMenu, !defersSelectionForScreenshot,
+           pid != getpid() { notifySelectionInvalidated() }
     }
     func attachObserver() {
         if let observer = observer { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes) }
@@ -213,52 +234,77 @@ final class SelectionMonitor {
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
         observer = created; observedApp = element
     }
+    // The capture tool can return focus after it has already delivered the crop.
+    // Only the start of a new external gesture should re-enable selection handling.
+    private func beginsGestureAfterScreenshot(_ event: NSEvent) -> Bool {
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown: return true
+        case .keyDown: return !event.isARepeat
+        case .scrollWheel:
+            guard event.momentumPhase.isEmpty else { return false }
+            if !event.phase.isEmpty { return event.phase.contains(.began) }
+            return event.scrollingDeltaX != 0 || event.scrollingDeltaY != 0
+        case .flagsChanged:
+            switch Int(event.keyCode) {
+            case kVK_Command, kVK_RightCommand: return event.modifierFlags.contains(.command)
+            case kVK_Shift, kVK_RightShift: return event.modifierFlags.contains(.shift)
+            case kVK_Option, kVK_RightOption: return event.modifierFlags.contains(.option)
+            case kVK_Control, kVK_RightControl: return event.modifierFlags.contains(.control)
+            default: return false
+            }
+        default: return false
+        }
+    }
     func event(_ event: NSEvent) {
         guard !screenshotSuspended else { return }
+        onTrackedEvent?(event)
         if modelMenuTracking {
             onInternalEvent?()
             if event.type == .keyDown, event.keyCode == 53 { onMenuCancel?() }
             return
         }
         guard event.timestamp > ignoreEventsThrough else { return }
-        if screenshotAwaitingFreshInput {
-            let newGesture = [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown, .scrollWheel, .mouseMoved].contains(event.type)
-                || (event.type == .flagsChanged && !event.modifierFlags.intersection([.control, .command, .shift, .option]).isEmpty)
-            guard newGesture else { return }
-            screenshotAwaitingFreshInput = false
-        }
+        if screenshotWorkPending?() == true {
+            // Keep the screenshot and its service requests alive through focus changes and
+            // scroll/keyboard activity. An outside click or Escape can still dismiss it.
+            let escape = event.type == .keyDown && event.keyCode == 53 && !event.isARepeat
+            guard event.type == .leftMouseDown || escape else { return }
+        } else if screenshotAwaitingFreshInput, !beginsGestureAfterScreenshot(event) { return }
         awaitingExternalInputAfterMenu = false
-        if !(event.type == .keyDown && event.keyCode == 53), isInternalInteraction?(NSEvent.mouseLocation) == true {
+        let point = NSEvent.mouseLocation
+        let externalKeyboard = [.keyDown, .keyUp, .flagsChanged].contains(event.type) && isOverAutomaticToolbar?(point) == true
+        if !(event.type == .keyDown && event.keyCode == 53), !externalKeyboard, isInternalInteraction?(point) == true {
             onInternalEvent?(); invalidateInternalRead(); return
         }
+        screenshotAwaitingFreshInput = false
         if [.leftMouseDown, .keyDown, .scrollWheel].contains(event.type) { hoverOwnsSelection = false }
         if onExternalEvent?(event) == true { return }
         switch event.type {
         case .leftMouseDown:
             // A new drag invalidates both queued and in-flight selection reads,
             // and clears the old glyph even when the result window is pinned.
-            invalidateInternalRead(); onSelection?(nil); onOutsideClick?(NSEvent.mouseLocation)
+            invalidateInternalRead(); notifySelectionInvalidated(); onOutsideClick?(NSEvent.mouseLocation)
         case .leftMouseUp: schedule()
         case .keyUp:
             if event.modifierFlags.contains(.shift) || (event.modifierFlags.contains(.command) && event.keyCode == 0) { schedule() }
         case .keyDown:
-            if event.keyCode == 53 { (onCancel ?? onScroll)?() }
-            else if !event.modifierFlags.contains(.shift) && !event.modifierFlags.contains(.command) { invalidateInternalRead(); onSelection?(nil) }
+            if event.keyCode == 53 { invalidateInternalRead(); (onCancel ?? onScroll)?() }
+            else if !event.modifierFlags.contains(.shift) && !event.modifierFlags.contains(.command) { invalidateInternalRead(); notifySelectionInvalidated() }
         case .scrollWheel: invalidateInternalRead(); onScroll?()
         default: break
         }
     }
     func schedule() {
-        guard !screenshotSuspended, !screenshotAwaitingFreshInput, !hoverOwnsSelection, !modelMenuTracking, !awaitingExternalInputAfterMenu else { return }
+        guard !defersSelectionForScreenshot, !hoverOwnsSelection, !modelMenuTracking, !awaitingExternalInputAfterMenu else { return }
         if Self.isLeftMouseDown { invalidateInternalRead(); return }
-        if isInternalInteraction?(NSEvent.mouseLocation) == true { invalidateInternalRead(); return }
+        if pointerBlocksSelectionRead { invalidateInternalRead(); return }
         revision += 1
         guard enabled, AXIsProcessTrusted() else { return }
         readRequested = true
         read()
     }
     private func read() {
-        guard !screenshotSuspended, !screenshotAwaitingFreshInput, readRequested, enabled, !hoverOwnsSelection, !modelMenuTracking, !awaitingExternalInputAfterMenu,
+        guard !defersSelectionForScreenshot, readRequested, enabled, !hoverOwnsSelection, !modelMenuTracking, !awaitingExternalInputAfterMenu,
               !readInFlight, !Self.isLeftMouseDown,
               let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return }
         readRequested = false
@@ -274,13 +320,37 @@ final class SelectionMonitor {
                 // read of the latest selection, without a debounce timer.
                 defer { self.read() }
                 if Self.isLeftMouseDown { self.invalidateInternalRead(); return }
-                guard !self.screenshotSuspended, !self.screenshotAwaitingFreshInput, !self.modelMenuTracking, !self.awaitingExternalInputAfterMenu,
-                      self.isInternalInteraction?(NSEvent.mouseLocation) != true else { return }
+                guard !self.defersSelectionForScreenshot, !self.modelMenuTracking, !self.awaitingExternalInputAfterMenu,
+                      !self.pointerBlocksSelectionRead else { return }
                 guard self.enabled, self.revision == ticket, self.interactionEpoch == epoch,
                       NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
                     return
                 }
                 self.onSelection?(snapshot)
+            }
+        }
+    }
+    private func notifySelectionInvalidated() {
+        if let onSelectionInvalidated { onSelectionInvalidated() } else { onSelection?(nil) }
+    }
+    private var pointerBlocksSelectionRead: Bool {
+        let point = NSEvent.mouseLocation
+        return isInternalInteraction?(point) == true && isOverAutomaticToolbar?(point) != true
+    }
+    #if QINGYI_TESTING
+    var toolbarReadFixture: ((pid_t, @escaping (SelectionSnapshot?) -> Void) -> Void)?
+    #endif
+    // A click can arrive before an AX notification for Shift-extended text.
+    // Verify against the source app at the original selection point without blocking AppKit.
+    func readForToolbar(pid: pid_t, mouse: CGPoint, completion: @escaping (SelectionSnapshot?) -> Void) {
+        #if QINGYI_TESTING
+        if let toolbarReadFixture { toolbarReadFixture(pid, completion); return }
+        #endif
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { completion(nil); return }
+        readQueue.async {
+            let snapshot = SelectionReader.read(pid: pid, mouse: mouse)
+            DispatchQueue.main.async {
+                completion(NSWorkspace.shared.frontmostApplication?.processIdentifier == pid ? snapshot : nil)
             }
         }
     }

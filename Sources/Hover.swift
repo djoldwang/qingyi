@@ -12,13 +12,14 @@ enum HoverDiagnostics {
 
 // Hover gestures do not register or consume system shortcuts.
 enum HoverTrigger: String, CaseIterable, Identifiable, Codable {
-    case control, shift, option, longPress
+    case control, shift, option, command, longPress
     var id: String { rawValue }
     var title: String {
         switch self {
         case .control: return "⌃ Control"
         case .shift: return "⇧ Shift"
         case .option: return "⌥ Option"
+        case .command: return "⌘ Command"
         case .longPress: return "长按鼠标左键"
         }
     }
@@ -27,7 +28,27 @@ enum HoverTrigger: String, CaseIterable, Identifiable, Codable {
         case .control: return .control
         case .shift: return .shift
         case .option: return .option
+        case .command: return .command
         case .longPress: return []
+        }
+    }
+}
+
+enum HoverActivation: String, CaseIterable, Identifiable {
+    case release, hold, mouseHold
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .release: return "单次按键"
+        case .hold: return "按住辅助键"
+        case .mouseHold: return "长按鼠标左键"
+        }
+    }
+    var hint: String {
+        switch self {
+        case .release: return "将鼠标放在段落上，单独按下并松开辅助键即可翻译；组合按键、点击或移动会取消触发。"
+        case .hold: return "将鼠标放在段落上，按住辅助键 0.6 秒即可翻译；组合按键、点击或移动会取消触发。"
+        case .mouseHold: return "将鼠标放在段落上，按住左键 0.6 秒即可翻译。移动超过 6 点会取消触发，正常拖选不受影响。"
         }
     }
 }
@@ -38,6 +59,7 @@ struct HoverGesture {
     enum Input: Equatable { case flags, keyDown, keyUp, leftDown, leftUp, otherMouseDown, move, scroll, cancel }
     enum Action: Equatable { case none, trigger, suppressSelection }
     var trigger: HoverTrigger = .longPress
+    var activation: HoverActivation = .release
     private(set) var origin: CGPoint?
     private(set) var holdDeadline: TimeInterval?
     private(set) var fired = false
@@ -50,7 +72,7 @@ struct HoverGesture {
         origin = nil; holdDeadline = nil; armedModifier = false; fired = false
         blocked = true
     }
-    mutating func reset() { self = HoverGesture(trigger: trigger) }
+    mutating func reset() { self = HoverGesture(trigger: trigger, activation: activation) }
     mutating func reconcileKeys(isDown: (UInt16) -> Bool) {
         // Global monitors do not receive releases delivered to our own windows
         // or consumed by another app. Discard only physically released keys.
@@ -71,7 +93,7 @@ struct HoverGesture {
                 origin = point; holdDeadline = time + Self.holdDuration; blocked = false
             }
         case .leftUp:
-            let suppress = fired
+            let suppress = trigger == .longPress && fired
             origin = nil; holdDeadline = nil; fired = false; armedModifier = false
             return suppress ? .suppressSelection : .none
         case .move:
@@ -86,21 +108,22 @@ struct HoverGesture {
                 return .none
             }
             if flags.isEmpty {
-                let fire = armedModifier && !blocked && buttons == 0 && keysDown.isEmpty
-                armedModifier = false; origin = nil; blocked = false
+                let fire = activation == .release && armedModifier && !blocked && buttons == 0 && keysDown.isEmpty
+                armedModifier = false; origin = nil; holdDeadline = nil; fired = false; blocked = false
                 return fire ? .trigger : .none
             }
             if previousFlags.isEmpty, flags == trigger.flag, buttons == 0, keysDown.isEmpty {
-                armedModifier = true; origin = point; blocked = false
+                armedModifier = true; origin = point; blocked = false; fired = false
+                if activation == .hold { holdDeadline = time + Self.holdDuration }
             } else if flags != trigger.flag {
-                armedModifier = false; origin = nil; blocked = true
+                armedModifier = false; origin = nil; holdDeadline = nil; blocked = true
             }
         }
         return .none
     }
     mutating func tick(time: TimeInterval, point: CGPoint, buttons: Int) -> Action {
         guard let deadline = holdDeadline, !fired else { return .none }
-        guard buttons == 1, let origin = origin,
+        guard (trigger == .longPress ? buttons == 1 : buttons == 0 && previousFlags == trigger.flag && armedModifier && !blocked && keysDown.isEmpty), let origin = origin,
               hypot(point.x - origin.x, point.y - origin.y) <= Self.movementTolerance else { cancel(); return .none }
         guard time >= deadline else { return .none }
         fired = true; holdDeadline = nil
@@ -117,8 +140,11 @@ final class HoverMonitor {
     private var timer: Timer?
     var enabled = false
     var isKeyDown: (UInt16) -> Bool = { CGEventSource.keyState(.combinedSessionState, key: $0) }
-    func configure(enabled: Bool, trigger: HoverTrigger) {
-        cancel(); self.enabled = enabled; gesture = HoverGesture(trigger: trigger)
+    var pressedMouseButtons: () -> Int = { NSEvent.pressedMouseButtons }
+    func configure(enabled: Bool, trigger: HoverTrigger, activation: HoverActivation? = nil) {
+        cancel(); self.enabled = enabled
+        let mode = activation ?? (trigger == .longPress ? .mouseHold : .release)
+        gesture = HoverGesture(trigger: mode == .mouseHold ? .longPress : (trigger == .longPress ? .option : trigger), activation: mode)
         HoverDiagnostics.log("configured enabled=\(enabled) trigger=\(trigger.rawValue)")
     }
     func cancel() {
@@ -141,19 +167,21 @@ final class HoverMonitor {
         default: return false
         }
         let point = NSEvent.mouseLocation
+        let buttons = pressedMouseButtons()
         if kind == .leftDown || kind == .flags { gesture.reconcileKeys(isDown: isKeyDown) }
-        if kind != .move { HoverDiagnostics.log("event=\(event.type.rawValue) flags=\(event.modifierFlags.rawValue) buttons=\(NSEvent.pressedMouseButtons)") }
+        if kind != .move { HoverDiagnostics.log("event=\(event.type.rawValue) flags=\(event.modifierFlags.rawValue) buttons=\(buttons)") }
         let action = gesture.input(kind, point: point, time: event.timestamp, flags: event.modifierFlags,
-                                   key: [.keyDown, .keyUp, .flagsChanged].contains(event.type) ? event.keyCode : 0, buttons: NSEvent.pressedMouseButtons)
+                                   key: [.keyDown, .keyUp, .flagsChanged].contains(event.type) ? event.keyCode : 0, buttons: buttons)
         if [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel].contains(event.type) { onCancelRead?() }
         timer?.invalidate(); timer = nil
         if let deadline = gesture.holdDeadline {
             let next = Timer(timeInterval: max(0.001, deadline - ProcessInfo.processInfo.systemUptime), repeats: false) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self = self, self.enabled else { return }
-                    HoverDiagnostics.log("hold timer buttons=\(NSEvent.pressedMouseButtons)")
+                    let buttons = self.pressedMouseButtons()
+                    HoverDiagnostics.log("hold timer buttons=\(buttons)")
                     if self.gesture.tick(time: ProcessInfo.processInfo.systemUptime, point: NSEvent.mouseLocation,
-                                         buttons: NSEvent.pressedMouseButtons) == .trigger { self.fire() }
+                                         buttons: buttons) == .trigger { self.fire() }
                 }
             }
             timer = next; RunLoop.main.add(next, forMode: .common)

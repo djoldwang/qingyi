@@ -52,6 +52,33 @@ extension QingyiTests {
             defaults.set("unknown", forKey: "hoverTranslationTrigger")
             try expect(Preferences(defaults: defaults).hoverTrigger == .longPress)
         }
+        check("Hover split settings migrate legacy choices and persist independent activation") {
+            let name = "qingyi-hover-split-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: name)!
+            defer { defaults.removePersistentDomain(forName: name) }
+            try expect(Preferences(defaults: defaults).hoverActivation == .mouseHold)
+            defaults.set("shift", forKey: "hoverTranslationTrigger")
+            let preferences = Preferences(defaults: defaults)
+            try expect(preferences.hoverModifier == .shift && preferences.hoverActivation == .release)
+            try expect(defaults.object(forKey: "hoverTranslationActivation") == nil, "Migration must not rewrite user defaults on launch")
+            preferences.hoverModifier = .command; preferences.hoverActivation = .hold
+            let reopened = Preferences(defaults: defaults)
+            try expect(reopened.hoverModifier == .command && reopened.hoverActivation == .hold)
+        }
+        check("Held hover modifier fires once at deadline, never on release or after a combination") {
+            for trigger in [HoverTrigger.option, .control, .shift, .command] {
+                var g = HoverGesture(trigger: trigger, activation: .hold)
+                _ = g.input(.flags, point: p, time: 0, flags: trigger.flag)
+                try expect(g.tick(time: 0.599, point: p, buttons: 0) == .none)
+                try expect(g.tick(time: 0.6, point: p, buttons: 0) == .trigger)
+                try expect(g.tick(time: 1, point: p, buttons: 0) == .none)
+                try expect(g.input(.flags, point: p, time: 1) == .none)
+                _ = g.input(.flags, point: p, time: 2, flags: trigger.flag)
+                _ = g.input(.keyDown, point: p, time: 2.1, flags: trigger.flag, key: 8)
+                try expect(g.tick(time: 3, point: p, buttons: 0) == .none)
+                try expect(g.input(.flags, point: p, time: 4) == .none)
+            }
+        }
         check("Long press fires at 0.6 seconds exactly once and owns its release") {
             var g = HoverGesture()
             _ = g.input(.leftDown, point: p, time: 1, buttons: 1)
@@ -132,6 +159,7 @@ extension QingyiTests {
         }
         check("Hover monitor recovers after internal input and application changes") {
             let monitor = HoverMonitor(); monitor.configure(enabled: true, trigger: .longPress)
+            monitor.pressedMouseButtons = { 1 }
             let down = NSEvent.keyEvent(with: .keyDown, location: p, modifierFlags: [], timestamp: 1, windowNumber: 0, context: nil, characters: "a", charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0)!
             let click = NSEvent.mouseEvent(with: .leftMouseDown, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             monitor.isKeyDown = { _ in true }

@@ -3,22 +3,44 @@ import SwiftUI
 // Disambiguate the property wrapper from the newer SDK State macro.
 typealias ViewState<Value> = SwiftUI.State<Value>
 
+enum AIServiceFeedback {
+    case success(String), failure(String)
+    var text: String {
+        switch self {
+        case .success(let text), .failure(let text): return text
+        }
+    }
+    var isSuccess: Bool {
+        if case .success = self { return true }
+        return false
+    }
+}
+
+struct AIServiceFeedbackView: View {
+    let feedback: AIServiceFeedback
+    var body: some View {
+        Text(feedback.text).font(.caption)
+            .foregroundStyle(feedback.isSuccess ? Color.green : Color.orange)
+            .textSelection(.enabled)
+    }
+}
+
 struct TranslationServiceSettings: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var api: APIConfigurationStore
     @ObservedObject var chat: ChatGPT
     @ObservedObject var services: BuiltinTranslationSettings = BuiltinTranslationSettings()
-    var verify: () -> Void
+    var client = CustomAPIClient()
     var edit: (APIProvider) -> Void
     var manageAccount: () -> Void
-    @ViewState<String> private var message = ""
+    @ViewState<AIServiceFeedback?> private var message = nil
+    @ViewState<Bool> private var verifying = false
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
-            TranslationServicesListView(store: services)
-            SettingsGroup(title: "AI 翻译") {
+            SettingsGroup(title: "全局 AI 模型") {
                 SettingsRow {
-                    Text("翻译服务").fixedSize(); Spacer()
-                    Picker("翻译服务", selection: Binding(get: { api.activeProviderID }, set: { id in perform { try api.selectProvider(id) } })) {
+                    Text("AI 服务").fixedSize(); Spacer()
+                    Picker("AI 服务", selection: Binding(get: { api.activeProviderID }, set: { id in perform { try api.selectProvider(id) } })) {
                         Text("未配置").tag(APIConfiguration.unconfiguredProviderID)
                         Text("ChatGPT 账号").tag("")
                         ForEach(api.providers) { Text($0.name).tag($0.id) }
@@ -29,15 +51,15 @@ struct TranslationServiceSettings: View {
                 }
                 Divider()
                 SettingsRow {
-                    Text("翻译模型").fixedSize(); Spacer()
+                    Text("默认模型").fixedSize(); Spacer()
                     if let provider = api.activeProvider {
-                        Picker("翻译模型", selection: Binding(get: { api.activeProvider?.selectedModelID ?? "" }, set: { id in perform { try api.selectModel(id) } })) {
+                        Picker("默认模型", selection: Binding(get: { api.activeProvider?.selectedModelID ?? "" }, set: { id in perform { try api.selectModel(id) } })) {
                             Text(provider.models.isEmpty ? "请先添加模型" : "请选择模型").tag("")
                             ForEach(provider.models) { Text($0.name).tag($0.id) }
                         }.labelsHidden().lineLimit(1).truncationMode(.tail).settingsControlColumn()
                             .help(provider.selectedModel?.name ?? "请选择模型").disabled(!api.loadError.isEmpty)
                     } else if api.activeProviderID.isEmpty {
-                        Picker("翻译模型", selection: $chat.modelID) {
+                        Picker("默认模型", selection: $chat.modelID) {
                             if chat.models.isEmpty { Text(chat.modelID.isEmpty ? "请连接账号并刷新模型" : chat.modelID).tag(chat.modelID) }
                             ForEach(chat.models) { Text($0.name).tag($0.id) }
                         }.labelsHidden().lineLimit(1).truncationMode(.tail).settingsControlColumn()
@@ -46,22 +68,22 @@ struct TranslationServiceSettings: View {
                 }
                 if let model = selectedReasoningModel {
                     Divider()
-                    reasoningSettings(for: model.key, supportsFast: model.supportsFast)
+                    reasoningSettings(for: model.key, supportsThinking: model.supportsThinking)
                 }
                 Divider()
                 SettingsRow {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(api.isUnconfigured ? "选择服务和模型后参与翻译" : api.activeProviderID.isEmpty ? "使用当前授权账号的订阅额度" : "使用所选服务商的 API 额度")
-                        Text("验证会发送一句固定英文。").font(.system(size: 11)).foregroundStyle(.secondary)
+                        Text("测试模型是否可用")
+                        Text(connectionTestHint).font(.system(size: 11)).foregroundStyle(.secondary)
                     }.fixedSize(horizontal: false, vertical: true)
                     Spacer()
-                    Button("验证一次翻译", action: verify)
+                    Button(verifying ? "测试中…" : "开始测试") { verifyGlobalModel() }
                         .settingsAction()
-                        .disabled(api.activeProviderID.isEmpty ? (!chat.signedIn || chat.modelID.isEmpty || chat.busy) : api.activeProvider?.selectedModel == nil)
+                        .accessibilityLabel(verifying ? "正在测试模型连接" : "开始测试模型连接")
+                        .disabled(verifying || (api.activeProviderID.isEmpty ? (!chat.signedIn || chat.modelID.isEmpty || chat.busy) : api.activeProvider?.selectedModel == nil))
                 }
             }
-            .disabled(!services.ai)
-            Text("每次翻译会将原文发送至已开启的内置服务和所选 AI 服务。译文窗口中的临时换模型仅影响本次 AI 译文。")
+            Text("动作默认跟随全局模型，也可在“AI 动作”页独立选择。优化提示词使用该动作选择的模型。")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 9) {
                 HStack {
@@ -94,58 +116,78 @@ struct TranslationServiceSettings: View {
                     }
                 }
             }
-            Text("模型列表不代表已验证访问权限。请求失败时不会自动切换服务。")
+            Text("选好默认模型后，点击“开始测试”可确认能否使用。请求失败时，轻译会保留当前服务。")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
-            if !message.isEmpty { Text(message).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
+            if let message { AIServiceFeedbackView(feedback: message) }
             if !api.loadError.isEmpty { Text(api.loadError).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
         }
     }
-    private var selectedReasoningModel: (key: ModelReasoningKey, supportsFast: Bool)? {
+    private var connectionTestHint: String {
+        if api.activeProviderID.isEmpty {
+            guard chat.signedIn else { return "先连接 ChatGPT 账号，再选择要测试的模型。" }
+            guard !chat.modelID.isEmpty else { return "先在上方选择要测试的默认模型。" }
+            return "让模型翻译一句示例英文，会使用当前 ChatGPT 账号的额度。"
+        }
+        guard let provider = api.activeProvider else { return "先在上方选择 AI 服务和默认模型。" }
+        guard provider.selectedModel != nil else { return "先为这个 API 服务选择默认模型。" }
+        return "让模型翻译一句示例英文。服务商可能收取 API 费用。"
+    }
+    private func verifyGlobalModel() {
+        guard !verifying else { return }
+        verifying = true; message = nil
+        Task { @MainActor in
+            defer { verifying = false }
+            do {
+                let engine = TranslationEngine(chat: chat, configuration: api, client: client)
+                let choice = try engine.defaultChoice()
+                _ = try await engine.translate("Small steps make complex things easier to understand.", target: choice.target, onUpdate: { _ in })
+                message = .success("已收到模型「\(choice.modelName)」的回复，连接正常。")
+            } catch { message = .failure("模型测试失败。" + error.localizedDescription) }
+        }
+    }
+    private var selectedReasoningModel: (key: ModelReasoningKey, supportsThinking: Bool)? {
         if let provider = api.activeProvider, let model = provider.selectedModel {
             return (ModelReasoningKey(provider: provider, modelID: model.id),
-                    FastTranslationCapability.supports(provider: provider, model: model))
+                    ThinkingCapability.supports(provider: provider, model: model))
         }
         if api.activeProviderID.isEmpty, !chat.activeID.isEmpty, !chat.modelID.isEmpty {
             return (ModelReasoningKey(accountID: chat.activeID, modelID: chat.modelID),
-                    FastTranslationCapability.supportsChatGPT(modelID: chat.modelID))
+                    ThinkingCapability.supportsChatGPT(modelID: chat.modelID))
         }
         return nil
     }
-    private func reasoningSettings(for key: ModelReasoningKey, supportsFast: Bool) -> some View {
-        let enabled = api.fastTranslationEnabled(for: key)
+    private func reasoningSettings(for key: ModelReasoningKey, supportsThinking: Bool) -> some View {
         let status = api.lastThinkingStatus(for: key)
-        let retried = api.lastTranslationUsedDefaultRetry(for: key)
+        let retry = api.lastThinkingRetry(for: key)
+        let confirmedColor = colorScheme == .dark ? Color(red: 0.55, green: 0.86, blue: 0.66) : Color(red: 0.13, green: 0.46, blue: 0.29)
         return VStack(alignment: .leading, spacing: 9) {
-            if supportsFast {
+            if supportsThinking {
                 VStack(alignment: .leading, spacing: 3) {
-                    Toggle(isOn: Binding(get: { api.fastTranslationEnabled(for: key) },
-                                         set: { api.setFastTranslation($0, for: key) })) {
-                        Text("快速翻译").font(.system(size: 13)).frame(maxWidth: .infinity, alignment: .leading)
+                    Toggle(isOn: Binding(get: { api.thinkingModeEnabled(for: key) },
+                                         set: { api.setThinkingMode($0, for: key) })) {
+                        Text("思考模式").font(.system(size: 13)).frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .toggleStyle(.switch).controlSize(.small)
-                    .accessibilityIdentifier("fastTranslation")
-                    if api.hasRememberedFastTranslationRejection(for: key) {
-                        Text("此服务已明确拒绝该模型的快速翻译请求，后续将直接使用默认模式。")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                            .accessibilityIdentifier("fastTranslationRejection")
-                        if enabled {
-                            Button("下次重新尝试快速模式") { api.clearFastTranslationRejection(for: key) }
-                                .buttonStyle(.link).font(.system(size: 11))
-                                .help("清除这条记录，在下一次翻译时重新尝试。")
-                                .accessibilityIdentifier("retryFastTranslationNextTime")
-                        }
-                    } else {
-                        Text(enabled ? "请求关闭思考。若服务明确拒绝，会记住并改用默认模式。若未返回译文，仅本次用默认模式重试。" : "下一次翻译使用服务默认的思考设置。")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
+                    .help("开启时请求使用思考，关闭时请求禁用思考。")
+                    .accessibilityIdentifier("thinkingMode")
+                    Text("关闭思考模式可提高速度，但可能降低复杂内容的理解与翻译质量。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             } else {
-                Text("此模型使用服务默认的思考设置。")
+                Text("此模型的思考模式由服务决定。")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 10) { thinkingStatusLabel; thinkingStatusValue(status, retried: retried) }.fixedSize()
-                VStack(alignment: .leading, spacing: 3) { thinkingStatusLabel; thinkingStatusValue(status, retried: retried) }
+            Label {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(status?.label ?? "这个模型还没有回复记录。")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(status == .confirmedOff ? confirmedColor : .primary)
+                    if let note = retry.note {
+                        Text(note).font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }.fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "clock.arrow.circlepath").foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 9).padding(.vertical, 7)
@@ -155,23 +197,12 @@ struct TranslationServiceSettings: View {
         }
         .padding(.horizontal, SettingsLayout.cardInset).padding(.vertical, 11)
     }
-    private var thinkingStatusLabel: some View {
-        Label("上次翻译的思考状态", systemImage: "clock.arrow.circlepath")
-            .font(.system(size: 11)).foregroundStyle(.secondary)
-    }
-    private func thinkingStatusValue(_ status: TranslationThinkingStatus?, retried: Bool) -> some View {
-        let confirmedColor = colorScheme == .dark ? Color(red: 0.55, green: 0.86, blue: 0.66) : Color(red: 0.13, green: 0.46, blue: 0.29)
-        let prefix = retried ? "已用默认模式重试 · " : ""
-        return Text(prefix + (status?.label ?? "暂无翻译记录"))
-            .font(.system(size: 12, weight: .medium))
-            .foregroundStyle(status == .confirmedOff ? confirmedColor : .primary)
-    }
     private var defaultBadge: some View {
         Text("默认服务").font(.system(size: 10)).foregroundStyle(Color.accentColor).fixedSize()
             .padding(.horizontal, 6).padding(.vertical, 2).background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 4))
     }
     private func perform(_ action: () throws -> Void) {
-        do { try action(); message = "" } catch { message = error.localizedDescription }
+        do { try action(); message = nil } catch { message = .failure(error.localizedDescription) }
     }
 }
 
@@ -206,7 +237,7 @@ struct APIProviderEditor: View {
     @ViewState<[APIModelForm]> private var models: [APIModelForm]
     @ViewState<String> private var key = ""
     @ViewState<Bool> private var showKey = false
-    @ViewState<String> private var message = ""
+    @ViewState<AIServiceFeedback?> private var message = nil
     @ViewState<Bool> private var fetching = false
     @ViewState<[APIModel]> private var candidates = []
     @ViewState<Set<String>> private var selected = []
@@ -217,12 +248,10 @@ struct APIProviderEditor: View {
     private let existing: Bool
     private let client: CustomAPIClient
     private let originalProvider: APIProvider
-    private let originalModels: [APIModelForm]
     init(api: APIConfigurationStore, provider: APIProvider, client: CustomAPIClient = CustomAPIClient(), navigation: SettingsNavigation? = nil) {
         self.api = api; self.client = client; self.navigation = navigation
         originalProvider = provider
         let forms = provider.models.map { APIModelForm(model: $0) }
-        originalModels = forms
         _provider = ViewState(initialValue: provider)
         _models = ViewState(initialValue: forms)
         existing = api.providers.contains { $0.id == provider.id }
@@ -230,14 +259,14 @@ struct APIProviderEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Button { leave() } label: { Label("翻译服务", systemImage: "chevron.left") }.buttonStyle(.link)
+                Button { leave() } label: { Label("AI 服务", systemImage: "chevron.left") }.buttonStyle(.link)
                 Spacer()
                 Button("取消") { finish() }.keyboardShortcut(.cancelAction).settingsAction()
                 Button("保存") { save() }.buttonStyle(.borderedProminent).disabled(fetching).settingsAction()
             }.padding(.horizontal, SettingsLayout.pageInset).padding(.vertical, 20)
             Divider()
-            if !message.isEmpty {
-                Text(message).font(.callout).foregroundStyle(message.hasPrefix("已") ? Color.secondary : Color.orange)
+            if let message {
+                Text(message.text).font(.callout).foregroundStyle(message.isSuccess ? Color.secondary : Color.orange)
                     .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, SettingsLayout.pageInset).padding(.top, 12)
             }
@@ -253,7 +282,7 @@ struct APIProviderEditor: View {
                         }
                     }
                     field("API 基础地址") { TextField("https://gateway.example/v1", text: $provider.baseURL) }
-                    Text("仅填写域名时补 /v1；网关前缀会保留。不要包含 /chat/completions、/responses 或 /messages。")
+                    Text(verbatim: "请输入带协议的基础地址，例如 https://gateway.example。省略路径时会自动补上 /v1，已有网关路径会保留。请省略 /responses 等具体接口路径。")
                         .font(.caption).foregroundStyle(.secondary)
                     field("API 密钥") {
                         HStack {
@@ -276,7 +305,7 @@ struct APIProviderEditor: View {
                             ProgressView().controlSize(.small)
                             Button("取消获取") { invalidateFetch() }
                         } else {
-                            Button("获取可用模型") { fetchModels() }
+                            Button("获取模型列表") { fetchModels() }
                         }
                     }
                     Text("获取操作会把密钥发送到上方 API 地址。导入模型后仍可修改显示名称；也可以直接手动添加。")
@@ -357,7 +386,9 @@ struct APIProviderEditor: View {
             }
         } message: { Text("将删除配置、模型列表及钥匙串中的对应密钥。删除正在使用的服务后需重新选择。") }
     }
-    private var hasUnsavedChanges: Bool { provider != originalProvider || models != originalModels || !key.isEmpty }
+    private var hasUnsavedChanges: Bool {
+        provider != originalProvider || !key.isEmpty || (try? models.map { try $0.model() }) != originalProvider.models
+    }
     private func finish() {
         invalidateFetch()
         if let navigation = navigation { navigation.editorFinished() } else { dismiss() }
@@ -374,7 +405,7 @@ struct APIProviderEditor: View {
         fetchID = UUID(); fetchTask?.cancel(); fetchTask = nil; fetching = false; candidates = []; selected = []
     }
     private func fetchModels() {
-        invalidateFetch(); message = ""
+        invalidateFetch(); message = nil
         do {
             var snapshot = provider
             snapshot.baseURL = try APIEndpoint.base(provider.baseURL).absoluteString
@@ -390,7 +421,7 @@ struct APIProviderEditor: View {
                     candidates = result
                     let existing = Set(models.map { TextPolicy.clean($0.modelID) })
                     selected = Set(result.map(\.id).filter { !existing.contains($0) })
-                    message = "已获取 \(result.count) 个模型。选择后点击导入；已有模型设置会保留。"
+                    message = .success("已获取 \(result.count) 个模型。选择后点击导入；已有模型设置会保留。")
                 } catch is CancellationError { }
                 catch {
                     if fetchID == run { message = apiEditorError(error) }
@@ -403,7 +434,7 @@ struct APIProviderEditor: View {
         for candidate in candidates where selected.contains(candidate.id) {
             if known.insert(candidate.id).inserted { models.append(APIModelForm(model: candidate)); added += 1 }
         }
-        message = "已导入 \(added) 个新模型；已有模型的名称、图片能力和输出上限保持原设置。"
+        message = .success(added == 0 ? "所选模型均已在列表中。" : "已将 \(added) 个新模型加入列表。点击“保存”后生效。")
         candidates = []; selected = []
     }
     private func save() {
@@ -414,9 +445,9 @@ struct APIProviderEditor: View {
             finish()
         } catch { message = apiEditorError(error) }
     }
-    private func apiEditorError(_ error: Error) -> String {
-        if error is URLError { return "网络连接失败，请检查 API 地址、网络或代理，也可手动添加模型。" }
-        return error.localizedDescription
+    private func apiEditorError(_ error: Error) -> AIServiceFeedback {
+        if error is URLError { return .failure("网络连接失败，请检查 API 地址、网络或代理，也可手动添加模型。") }
+        return .failure(error.localizedDescription)
     }
 }
 

@@ -1,5 +1,22 @@
 import AppKit
+import Combine
 import CoreGraphics
+
+// Accessory apps may receive window focus after activate() has returned.
+@MainActor
+func whenSettingsWindowHasFocus(_ window: NSWindow, perform action: @escaping () -> Void) -> AnyCancellable {
+    let center = NotificationCenter.default
+    let closeOrMinimize = center.publisher(for: NSWindow.willCloseNotification, object: window)
+        .merge(with: center.publisher(for: NSWindow.didMiniaturizeNotification, object: window))
+    return center.publisher(for: NSWindow.didBecomeKeyNotification, object: window)
+        .merge(with: center.publisher(for: NSApplication.didBecomeActiveNotification, object: NSApp))
+        .map { _ in () }
+        .prepend(())
+        .prefix(untilOutputFrom: closeOrMinimize)
+        .filter { [weak window] in NSApp.isActive && window?.isKeyWindow == true && window?.isVisible == true }
+        .first()
+        .sink { action() }
+}
 
 // Keep the return policy independent of the workspace so races around window
 // closing, activation and termination can be tested with a deterministic clock.
@@ -219,7 +236,16 @@ final class SystemSettingsReturnCoordinator {
 // Observe only a credential operation begun while our settings were active.
 // Completing an ordinary, already-authorized read must never activate the app.
 struct CredentialWindowReturnState {
-    enum Foreground { case owner, authorization, other, unknown }
+    enum Foreground {
+        case owner, authorization, other, unknown
+
+        init(appIsActive: Bool, frontmostPID: pid_t?, ownerPID: pid_t, authorizationIsFrontmost: Bool) {
+            // The key-window notification can precede the workspace PID update.
+            if authorizationIsFrontmost { self = .authorization }
+            else if appIsActive || frontmostPID == ownerPID { self = .owner }
+            else { self = frontmostPID == nil ? .unknown : .other }
+        }
+    }
     enum Outcome { case waiting, restore, cancel }
     private(set) var sawAuthorization = false
     private var otherApplicationSince: TimeInterval?
@@ -317,7 +343,6 @@ final class CredentialWindowReturnCoordinator {
         let prompts = NSWorkspace.shared.runningApplications.filter(authorizationApplication)
         let promptPIDs = Set(prompts.map(\.processIdentifier))
         let foreground = NSWorkspace.shared.frontmostApplication
-        let owner = foreground?.processIdentifier == getpid()
         let authorization = foreground.map(authorizationApplication) == true
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
         let visible = windows?.contains {
@@ -327,11 +352,8 @@ final class CredentialWindowReturnCoordinator {
             return rect.width > 80 && rect.height > 40 && ($0[kCGWindowAlpha as String] as? Double ?? 1) > 0
         } == true
         let sourceAvailable = window?.isVisible == true && window?.isMiniaturized == false && window?.isOnActiveSpace == true
-        let current: CredentialWindowReturnState.Foreground
-        if foreground == nil { current = .unknown }
-        else if owner { current = .owner }
-        else if authorization { current = .authorization }
-        else { current = .other }
+        let current = CredentialWindowReturnState.Foreground(appIsActive: NSApp.isActive,
+            frontmostPID: foreground?.processIdentifier, ownerPID: getpid(), authorizationIsFrontmost: authorization)
         let outcome = state.update(at: now, foreground: current,
             authorizationVisible: visible, accessFinished: reads.isEmpty, sourceAvailable: sourceAvailable)
         // Give a dismissed system panel time to leave WindowServer. A timeout

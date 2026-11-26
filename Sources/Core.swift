@@ -53,8 +53,23 @@ func formBody(_ fields: [String: String]) -> Data {
 }
 
 enum AppVersion {
-    static var display: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.3" }
+    static var display: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.4" }
     static var menuTitle: String { "轻译 \(display)" }
+}
+
+enum TextOperation: Hashable {
+    case translation, polishing
+    case custom(AIAction)
+    var customAction: AIAction? { if case .custom(let action) = self { return action }; return nil }
+    var aiOnly: Bool { self != .translation }
+    var key: String { customAction?.id.uuidString ?? (self == .polishing ? "polishing" : "translation") }
+    var action: String { customAction?.name ?? (self == .polishing ? "润色" : "翻译") }
+    var resultName: String { customAction.map { $0.name + "结果" } ?? (self == .polishing ? "润色结果" : "译文") }
+    var accessibilityResultName: String { customAction == nil ? (self == .polishing ? "中文润色结果" : "中文译文") : resultName }
+    var selectionMark: String { self == .polishing ? "润" : "译" }
+    func serviceName(_ service: TranslationServiceID) -> String {
+        service == .ai && aiOnly ? "AI \(action)" : service.name
+    }
 }
 
 enum TextPolicy {
@@ -88,6 +103,17 @@ enum TextPolicy {
         if text.count == 1, text.first?.isLetter == true { return false }
         return !isStandaloneAddress(text) && needsTranslation(text)
     }
+    // Only selection uses this routing. Clipboard, hover and OCR keep their
+    // translation-only validation and Chinese skip behavior.
+    static func automaticSelectionOperation(_ raw: String) -> TextOperation? {
+        let text = clean(raw)
+        guard !isStandaloneAddress(text) else { return nil }
+        if isChinese(text) { return .polishing }
+        return shouldOfferAutomaticTranslation(text) ? .translation : nil
+    }
+    static func isChinese(_ text: String) -> Bool {
+        text.unicodeScalars.contains { (0x3400...0x9fff).contains($0.value) } && !needsTranslation(text)
+    }
     static func needsTranslation(_ text: String) -> Bool {
         let text = clean(text)
         guard !text.isEmpty else { return false }
@@ -99,8 +125,19 @@ enum TextPolicy {
         let letters = text.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
         return han == 0 || Double(han) / Double(max(letters, 1)) < 0.65
     }
-    static func validate(_ text: String) throws -> String {
+    static func validate(_ text: String, operation: TextOperation = .translation) throws -> String {
         let text = clean(text)
+        if operation.customAction != nil {
+            guard !text.isEmpty else { throw QingyiError.message("没有可处理的文字，请先选中文字。") }
+            guard text.count <= maximumLength else { throw QingyiError.message("这段文字超过 12,000 字，请缩小选区后重试。") }
+            return text
+        }
+        if operation == .polishing {
+            guard !text.isEmpty else { throw QingyiError.message("没有可润色的文字。请先选中中文。") }
+            guard text.count <= maximumLength else { throw QingyiError.message("这段文字超过 12,000 字，请缩小选区后再润色。") }
+            guard isChinese(text), !isStandaloneAddress(text) else { throw QingyiError.message("请选择中文进行润色。") }
+            return text
+        }
         guard !text.isEmpty else { throw QingyiError.message("没有可翻译的文字。请先选中文字，或复制文字后按快捷键。") }
         guard text.count <= maximumLength else { throw QingyiError.message("这段文字超过 12,000 字，请缩小选区后再翻译。") }
         guard needsTranslation(text) else { throw QingyiError.message("这段文字已经是中文。默认只将外语翻译为简体中文。") }
@@ -221,8 +258,8 @@ enum CredentialStore {
     }
 }
 
-enum FastTranslationFallbackReason: LocalizedError, Equatable {
-    case unsupportedParameter, invalidParameter, emptyTranslation
+enum TranslationRequestError: LocalizedError, Equatable {
+    case rejectedThinkingParameter(modelID: String, enabled: Bool, argument: String), emptyTranslation, refused
 
     static func checkEmptyResponse(_ response: HTTPURLResponse, receivedBytes: Bool) throws {
         guard !receivedBytes else { return }
@@ -235,29 +272,71 @@ enum FastTranslationFallbackReason: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .unsupportedParameter: return "当前服务不支持此模型的快速翻译参数。"
-        case .invalidParameter: return "当前服务未接受本次快速翻译参数。"
+        case .rejectedThinkingParameter(let modelID, let enabled, let argument):
+            let mode = enabled ? "开启" : "关闭"
+            return "服务拒绝了模型「\(modelID)」\(mode)思考的请求（\(argument)）。请检查模型与思考模式设置。"
         case .emptyTranslation: return "模型已完成请求，但没有返回可用译文。"
+        case .refused: return "模型拒绝了本次请求。"
         }
     }
 }
 
 // Match only the control actually sent in this request. An error can mention
 // reasoning as context while rejecting a different parameter such as temperature.
-enum FastTranslationParameter: String {
-    case thinking, reasoning, reasoningEffort = "reasoning_effort"
+struct ThinkingParameter {
+    enum Value {
+        case thinking(type: String, budget: Int? = nil)
+        case reasoning(effort: String)
+        case reasoningEffort(String)
+    }
+    let modelID: String
+    let enabled: Bool
+    let value: Value
 
-    var value: Any {
-        switch self {
-        case .thinking: return ["type": "disabled"]
-        case .reasoning: return ["effort": "none"]
-        case .reasoningEffort: return "none"
+    private var field: String {
+        switch value {
+        case .thinking: return "thinking"
+        case .reasoning: return "reasoning"
+        case .reasoningEffort: return "reasoning_effort"
+        }
+    }
+
+    private var sentValue: String {
+        switch value {
+        case .thinking(let type, _): return type
+        case .reasoning(let effort), .reasoningEffort(let effort): return effort
+        }
+    }
+
+    func apply(to body: inout [String: Any]) throws {
+        switch value {
+        case .thinking(let type, let budget):
+            var settings: [String: Any] = ["type": type]
+            if let budget {
+                guard let limit = body["max_tokens"] as? Int, limit > budget else {
+                    throw QingyiError.message("此模型开启思考需要预留 \(budget) 个 token，请将最大输出 token 数设为大于 \(budget)。")
+                }
+                settings["budget_tokens"] = budget
+            }
+            body[field] = settings
+        case .reasoning(let effort): body[field] = ["effort": effort]
+        case .reasoningEffort(let effort): body[field] = effort
+        }
+    }
+
+    private var argumentDescription: String {
+        switch value {
+        case .thinking(let type, let budget):
+            let argument = "thinking.type=\(type)"
+            return budget.map { argument + ", thinking.budget_tokens=\($0)" } ?? argument
+        case .reasoning(let effort): return "reasoning.effort=\(effort)"
+        case .reasoningEffort(let effort): return "reasoning_effort=\(effort)"
         }
     }
 
     private var acceptedPaths: [String] {
-        switch self {
-        case .thinking: return ["thinking", "thinking.type"]
+        switch value {
+        case .thinking(_, let budget): return budget == nil ? ["thinking", "thinking.type"] : ["thinking", "thinking.type", "thinking.budget_tokens"]
         case .reasoning: return ["reasoning", "reasoning.effort"]
         case .reasoningEffort: return ["reasoning_effort"]
         }
@@ -278,8 +357,7 @@ enum FastTranslationParameter: String {
         let blocked = ["quota", "rate_limit", "billing", "balance", "credit", "auth", "api_key", "permission", "access_denied", "content_filter", "content_policy", "safety", "overloaded", "server_error"]
         guard !blocked.contains(where: code.contains) else { return }
         let message = (error["message"] as? String ?? error["detail"] as? String ?? error["error"] as? String ?? "").lowercased()
-        let temporary = ["temporarily", "try again later", "暂时", "临时", "稍后重试"].contains(where: message.contains)
-        let rejection: FastTranslationFallbackReason = temporary ? .invalidParameter : .unsupportedParameter
+        let rejection = TranslationRequestError.rejectedThinkingParameter(modelID: modelID, enabled: enabled, argument: argumentDescription)
         if let items = envelope["detail"] as? [[String: Any]] {
             for item in items {
                 guard let location = item["loc"] as? [String], location.first == "body",
@@ -296,13 +374,11 @@ enum FastTranslationParameter: String {
             if unsupportedCodes.contains(code) || unsupportedMessages.contains(where: message.contains) {
                 throw rejection
             }
-            // A generic validation failure can justify one retry without establishing a lasting capability.
             if ["invalid_value", "invalid_parameter"].contains(code) || message.contains("invalid") || message.contains("无效") {
-                throw FastTranslationFallbackReason.invalidParameter
+                throw rejection
             }
             return
         }
-        let sentValue = self == .thinking ? "disabled" : "none"
         let paths = acceptedPaths.map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|")
         let control = "(?<![a-z0-9_.-])(?:\(paths))(?:\\.\(sentValue))?(?![a-z0-9_.-])"
         let marks = #"[\s:'"\x{60}“”‘’：]*"#
@@ -366,7 +442,7 @@ enum TranslationThinkingEvidence: Equatable {
 // Stateful SSE parser, kept independent of URLSession so fragmented/multi-line events can be tested.
 struct ResponseStream {
     var dataLines: [String] = []
-    var fastParameter: FastTranslationParameter?
+    var thinkingParameter: ThinkingParameter?
     private var refused = false
     private(set) var text = ""
     private(set) var thinkingEvidence = TranslationThinkingEvidence.unreported
@@ -413,7 +489,7 @@ struct ResponseStream {
             completed = true
             return text
         case "response.failed", "error":
-            if !refused, TextPolicy.clean(text).isEmpty { try fastParameter?.checkRejection(in: event) }
+            if !refused, TextPolicy.clean(text).isEmpty { try thinkingParameter?.checkRejection(in: event) }
             throw QingyiError.message("模型未能完成翻译，请重试或在设置中切换模型。")
         case "response.incomplete":
             throw QingyiError.message("模型未能完成翻译，请重试或在设置中切换模型。")
@@ -423,8 +499,8 @@ struct ResponseStream {
     mutating func finish() throws -> String {
         _ = try line("")
         guard completed else { throw QingyiError.message("翻译连接提前结束，结果不完整，请重试。") }
-        guard !refused else { throw QingyiError.message("模型拒绝了本次翻译。") }
-        guard !TextPolicy.clean(text).isEmpty else { throw FastTranslationFallbackReason.emptyTranslation }
+        guard !refused else { throw TranslationRequestError.refused }
+        guard !TextPolicy.clean(text).isEmpty else { throw TranslationRequestError.emptyTranslation }
         return text
     }
     static func containsRefusal(_ output: [[String: Any]]) -> Bool {
@@ -470,9 +546,9 @@ struct TranslationDecoder {
     var thinkingEvidence: TranslationThinkingEvidence { format == .json ? jsonThinkingEvidence : stream.thinkingEvidence }
     private var eventSize = 0
     let contentType: String
-    init(contentType: String, fastParameter: FastTranslationParameter? = nil) {
+    init(contentType: String, thinkingParameter: ThinkingParameter? = nil) {
         self.contentType = contentType
-        stream.fastParameter = fastParameter
+        stream.thinkingParameter = thinkingParameter
     }
     var completed: Bool { (format == .sse || format == .jsonEvents) && stream.completed }
     mutating func line(_ raw: String) throws -> String? {
@@ -512,7 +588,7 @@ struct TranslationDecoder {
         if format == .sse || format == .jsonEvents { return try stream.finish() }
         guard format == .json, let data = json.data(using: .utf8), let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw QingyiError.message("翻译接口没有返回完整结果，请重试。") }
         if let error = object["error"], !(error is NSNull) {
-            try stream.fastParameter?.checkRejection(in: object)
+            try stream.thinkingParameter?.checkRejection(in: object)
             let code = (error as? [String: Any])?["code"] as? String ?? "unknown"
             throw QingyiError.message("翻译服务返回错误（\(code)），请重试或切换模型。")
         }
@@ -520,10 +596,10 @@ struct TranslationDecoder {
         if object["type"] as? String == "response.completed", let wrapped = object["response"] as? [String: Any] { response = wrapped }
         else { response = object }
         guard response["status"] as? String == "completed", let output = response["output"] as? [[String: Any]] else { throw QingyiError.message("模型未返回已完成的翻译结果，请重试或切换模型。") }
-        guard !ResponseStream.containsRefusal(output) else { throw QingyiError.message("模型拒绝了本次翻译。") }
+        guard !ResponseStream.containsRefusal(output) else { throw TranslationRequestError.refused }
         jsonThinkingEvidence.observeResponse(response)
         let text = output.flatMap { $0["content"] as? [[String: Any]] ?? [] }.filter { $0["type"] as? String == "output_text" }.compactMap { $0["text"] as? String }.joined()
-        guard !TextPolicy.clean(text).isEmpty else { throw FastTranslationFallbackReason.emptyTranslation }
+        guard !TextPolicy.clean(text).isEmpty else { throw TranslationRequestError.emptyTranslation }
         return text
     }
 }

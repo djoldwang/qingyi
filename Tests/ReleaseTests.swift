@@ -40,12 +40,12 @@ extension QingyiTests {
             defer { floating.hide() }
             var requests = 0
             floating.onTrigger = { requests += 1 }
-            let values = ["a", "é", "---", "/", "😀", "https://example.com", "中文句子。"]
+            let values = ["a", "é", "---", "/", "😀", "https://example.com"]
             for value in values {
                 floating.offerAutomaticTranslation(for: value, position: .lowerLeft)
                 try expect(!floating.buttonPanel.isVisible && !floating.resultPanel.isVisible)
             }
-            floating.showResult(source: "Original text", preview: true)
+            floating.showResult(preview: true)
             floating.state.text = "保留的译文"; floating.state.pinned = true
             for value in values {
                 floating.offerAutomaticTranslation(for: value, position: .lowerLeft, preserveResult: true)
@@ -85,8 +85,8 @@ extension QingyiTests {
             try expect(view.textColor == NSColor.black)
             view.updateText(text, dark: true, fontSize: 17.3)
             try expect(abs((view.font?.pointSize ?? 0) - 17.3) < 0.001 && view.string == text)
-            let small = TranslationWindowLayout.contentHeight(source: "Hello", text: text, fontSize: 12)
-            let large = TranslationWindowLayout.contentHeight(source: "Hello", text: text, fontSize: 24)
+            let small = TranslationWindowLayout.contentHeight(text: text, fontSize: 12)
+            let large = TranslationWindowLayout.contentHeight(text: text, fontSize: 24)
             try expect(large > small)
         }
         check("Native model menu temporarily yields window level and restores screenSaver level") {

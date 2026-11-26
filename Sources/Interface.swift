@@ -16,8 +16,15 @@ struct ExclusionAdditionResult {
     }
 }
 
+enum SelectionMode: String, CaseIterable, Identifiable {
+    case compact, toolbar
+    var id: Self { self }
+    var title: String { self == .compact ? "简洁按钮" : "直接显示动作栏" }
+    var defaultPosition: ButtonPosition { self == .compact ? .lowerLeft : .below }
+}
+
 enum ButtonPosition: String, CaseIterable, Identifiable {
-    case lowerLeft, lowerRight, upperLeft, upperRight
+    case lowerLeft, lowerRight, upperLeft, upperRight, above, below
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -25,29 +32,68 @@ enum ButtonPosition: String, CaseIterable, Identifiable {
         case .lowerRight: return "鼠标右下方"
         case .upperLeft: return "鼠标左上方"
         case .upperRight: return "鼠标右上方"
+        case .above: return "鼠标上方"
+        case .below: return "鼠标下方"
         }
     }
     func origin(relativeTo mouse: NSPoint, size: NSSize) -> NSPoint {
-        let left = self == .lowerLeft || self == .upperLeft
-        let below = self == .lowerLeft || self == .lowerRight
-        // AppKit coordinates start at the bottom-left. Keep the whole button
-        // on the chosen side of the pointer, with a 12 pt gap on both axes.
-        return NSPoint(x: left ? mouse.x - 12 - size.width : mouse.x + 12,
-                       y: below ? mouse.y - 12 - size.height : mouse.y + 12)
+        let x: CGFloat
+        switch self {
+        case .upperLeft, .lowerLeft: x = mouse.x - 12 - size.width
+        case .upperRight, .lowerRight: x = mouse.x + 12
+        case .above, .below: x = mouse.x - size.width / 2
+        }
+        let belowPointer = self == .below || self == .lowerLeft || self == .lowerRight
+        return NSPoint(x: x, y: belowPointer ? mouse.y - 12 - size.height : mouse.y + 12)
+    }
+
+    func placedOrigin(relativeTo mouse: NSPoint, size: NSSize, screen: NSRect) -> NSPoint {
+        var point = origin(relativeTo: mouse, size: size)
+        let bounds = screen.insetBy(dx: 10, dy: 10)
+        // Flip before clamping so an entry at a screen edge doesn't appear under the pointer.
+        if point.y < bounds.minY { point.y = mouse.y + 12 }
+        else if point.y + size.height > bounds.maxY { point.y = mouse.y - 12 - size.height }
+        if self != .above && self != .below {
+            if point.x < bounds.minX && mouse.x + 12 + size.width <= bounds.maxX { point.x = mouse.x + 12 }
+            else if point.x + size.width > bounds.maxX && mouse.x - 12 - size.width >= bounds.minX { point.x = mouse.x - 12 - size.width }
+        }
+        return FloatingController.clamped(point, size: size, screen: screen)
     }
 }
 
 @MainActor
 final class Preferences: ObservableObject {
     private let defaults: UserDefaults
-    @Published var buttonPosition: ButtonPosition {
-        didSet { defaults.set(buttonPosition.rawValue, forKey: "selectionButtonPosition") }
+    private static let positionsByModeKey = "selectionPositionsByMode"
+    @Published var selectionMode: SelectionMode {
+        didSet { defaults.set(selectionMode.rawValue, forKey: "selectionMode") }
+    }
+    @Published private var positionsByMode: [String: String] {
+        didSet { defaults.set(positionsByMode, forKey: Self.positionsByModeKey) }
+    }
+    private func savedPosition(for mode: SelectionMode) -> ButtonPosition {
+        positionsByMode[mode.rawValue].flatMap(ButtonPosition.init(rawValue:)) ?? mode.defaultPosition
+    }
+    var buttonPosition: ButtonPosition {
+        get { savedPosition(for: .compact) }
+        set { positionsByMode[SelectionMode.compact.rawValue] = newValue.rawValue }
+    }
+    var actionBarPosition: ButtonPosition {
+        get { savedPosition(for: .toolbar) }
+        set { positionsByMode[SelectionMode.toolbar.rawValue] = newValue.rawValue }
     }
     @Published var hoverEnabled: Bool {
         didSet { defaults.set(hoverEnabled, forKey: "hoverTranslationEnabled") }
     }
     @Published var hoverTrigger: HoverTrigger {
         didSet { defaults.set(hoverTrigger.rawValue, forKey: "hoverTranslationTrigger") }
+    }
+    @Published var hoverActivation: HoverActivation {
+        didSet { defaults.set(hoverActivation.rawValue, forKey: "hoverTranslationActivation") }
+    }
+    var hoverModifier: AIActionModifier {
+        get { AIActionModifier(rawValue: hoverTrigger.rawValue) ?? .option }
+        set { hoverTrigger = HoverTrigger(rawValue: newValue.rawValue) ?? .option }
     }
     @Published var paused = false
     var selectionEnabled: Bool {
@@ -73,11 +119,25 @@ final class Preferences: ObservableObject {
     private var excludedAppLocations: [String: String]
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        let mode = defaults.string(forKey: "selectionMode").flatMap(SelectionMode.init(rawValue:)) ?? .compact
+        selectionMode = mode
+        if let saved = defaults.dictionary(forKey: Self.positionsByModeKey) as? [String: String] {
+            positionsByMode = saved
+        } else if let old = defaults.string(forKey: "selectionButtonPosition").flatMap(ButtonPosition.init(rawValue:)) {
+            // The previous version stored one explicit choice for both modes.
+            let migrated = [mode.rawValue: old.rawValue]
+            positionsByMode = migrated
+            defaults.set(migrated, forKey: Self.positionsByModeKey)
+        } else {
+            positionsByMode = [:]
+        }
         hoverEnabled = defaults.bool(forKey: "hoverTranslationEnabled")
-        hoverTrigger = HoverTrigger(rawValue: defaults.string(forKey: "hoverTranslationTrigger") ?? "") ?? .longPress
+        let savedHoverTrigger = HoverTrigger(rawValue: defaults.string(forKey: "hoverTranslationTrigger") ?? "") ?? .longPress
+        hoverTrigger = savedHoverTrigger
+        hoverActivation = HoverActivation(rawValue: defaults.string(forKey: "hoverTranslationActivation") ?? "")
+            ?? (savedHoverTrigger == .longPress ? .mouseHold : .release)
         excludedAppLocations = defaults.dictionary(forKey: "excludedAppLocations") as? [String: String] ?? [:]
         excluded = defaults.stringArray(forKey: "excludedApps") ?? []
-        buttonPosition = ButtonPosition(rawValue: defaults.string(forKey: "selectionButtonPosition") ?? "") ?? .lowerLeft
         translationWindowPosition = TranslationWindowPosition(rawValue: defaults.string(forKey: "translationWindowPosition") ?? "") ?? .upperRight
         let savedFontSize = (defaults.object(forKey: "translationFontSize") as? NSNumber)?.doubleValue ?? TranslationFontSize.standard
         translationFontSize = TranslationFontSize.normalized(savedFontSize)
@@ -221,9 +281,11 @@ struct ShortcutRecorder: NSViewRepresentable {
 
 @MainActor
 final class FloatingState: ObservableObject {
+    @Published var operation: TextOperation = .translation
     @Published var fontSize: CGFloat = 15
-    @Published var source = ""
+    @Published var resultActions: [TextOperation] = []
     @Published var text = ""
+    @Published var loadingMessage: String?
     @Published var status = "正在翻译"
     @Published var loading = false
     @Published var error = false
@@ -234,11 +296,25 @@ final class FloatingState: ObservableObject {
     @Published var defaultChoice: TranslationChoice?
     @Published var modelGroups: [TranslationModelGroup] = []
     @Published var modelSelectionEnabled = false
+    @Published var actionAvailable = true
     @Published var temporaryModel = false
     @Published var loadingChatGPTModels = false
     @Published var modelMenuMessage = ""
     @Published var pinned = false
     @Published var services: [ServiceTranslationResult] = []
+}
+
+enum TranslationWindowExample {
+    static let source = "Small steps make things easier."
+    static let translation = "小小的进步，让事情变得更简单。"
+
+    @MainActor static func populate(_ state: FloatingState, fontSize: CGFloat) {
+        state.fontSize = fontSize
+        state.text = translation
+        state.services = [ServiceTranslationResult(id: .youdao, loading: false, result: BuiltinTranslationResult(text: translation))]
+        state.loading = false
+        state.complete = true
+    }
 }
 
 struct TranslationCard: View {
@@ -253,7 +329,12 @@ struct TranslationCard: View {
     var loadModels: (UUID) -> Void = { _ in }
     var togglePin: () -> Void = {}
     var retryService: (TranslationServiceID) -> Void = { _ in }
+    var switchAction: (TextOperation, UUID) -> Void = { _, _ in }
+    var fitsServiceContent = false
     private let accent = Color(red: 0.27, green: 0.32, blue: 0.83)
+    private var serviceResults: ServiceResultsBody {
+        ServiceResultsBody(state: state, retry: retryService, modelMenuTracking: modelMenuTracking, selectModel: selectModel, restoreModel: restoreModel, loadModels: loadModels)
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
@@ -263,33 +344,39 @@ struct TranslationCard: View {
                         .frame(width: 23, height: 22)
                 }.buttonStyle(.plain)
                     .help(state.pinned ? "取消钉住" : "钉住窗口，点击外部或切换应用时保留")
-                    .accessibilityLabel(state.pinned ? "取消钉住" : "钉住译文窗口")
-                TranslationDragArea().frame(maxWidth: .infinity).frame(height: 22)
+                    .accessibilityLabel(state.pinned ? "取消钉住" : "钉住\(state.operation.resultName)窗口")
+                TranslationDragArea(operation: state.operation).frame(maxWidth: .infinity).frame(height: 22)
                 if state.loading { ProgressView().controlSize(.small) }
-                Button(action: close) { Image(systemName: "xmark").font(.system(size: 11, weight: .medium)).frame(width: 23, height: 23) }.buttonStyle(.plain).help("关闭（Esc）").accessibilityLabel("关闭翻译")
+                Button(action: close) { Image(systemName: "xmark").font(.system(size: 11, weight: .medium)).frame(width: 23, height: 23) }.buttonStyle(.plain).help("关闭（Esc）").accessibilityLabel("关闭\(state.operation.action)")
             }.padding(.horizontal, 12).frame(height: TranslationWindowLayout.headerHeight)
             Divider().opacity(0.5)
             if state.services.isEmpty {
-                TranslationBodyScrollArea(source: state.source, text: state.text, error: state.error, dark: colorScheme == .dark, fontSize: state.fontSize)
+                TranslationBodyScrollArea(sessionID: state.sessionID, text: state.text, error: state.error, dark: colorScheme == .dark,
+                                          fontSize: state.fontSize, operation: state.operation, loadingMessage: state.loadingMessage)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if fitsServiceContent {
+                serviceResults
             } else {
-                ServicesScrollArea(bodyView: ServiceResultsBody(state: state, retry: retryService, modelMenuTracking: modelMenuTracking, selectModel: selectModel, restoreModel: restoreModel, loadModels: loadModels))
+                ServicesScrollArea(bodyView: serviceResults)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             Divider().opacity(0.5)
             HStack(spacing: 8) {
-                if state.services.isEmpty {
+                if state.operation.aiOnly && !state.resultActions.isEmpty {
+                    ResultActionButtons(actions: state.resultActions, sessionID: state.sessionID,
+                                        tracking: modelMenuTracking, select: switchAction)
+                        .frame(maxWidth: .infinity).frame(height: 24)
+                } else if state.services.isEmpty {
                     TemporaryModelPicker(state: state, tracking: modelMenuTracking, select: selectModel, restore: restoreModel, load: loadModels)
                         .frame(minWidth: 64).frame(height: 24)
                 } else {
-                    Button(action: settings) { Image(systemName: "slider.horizontal.3") }.help("翻译服务设置")
                     Text("\(state.services.count) 个服务").foregroundStyle(.secondary)
                 }
                 if state.temporaryModel && state.services.isEmpty {
                     Text("本次").font(.system(size: 9)).foregroundStyle(.secondary)
-                        .fixedSize().help("临时模型，仅当前译文生效")
+                        .fixedSize().help("临时模型，仅当前\(state.operation.resultName)生效")
                 }
-                Spacer(minLength: 0)
+                if state.resultActions.isEmpty { Spacer(minLength: 0) }
                 if state.services.isEmpty && state.error {
                     Button("设置", action: settings).fixedSize().frame(minHeight: 24)
                     Button("重试", action: retry).fixedSize().frame(minHeight: 24)
@@ -298,7 +385,7 @@ struct TranslationCard: View {
                     Button {
                         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(state.text, forType: .string)
                     } label: { Image(systemName: "doc.on.doc").frame(width: 24, height: 24) }
-                    .help("复制译文").accessibilityLabel("复制译文").disabled(!state.complete)
+                    .help("复制\(state.operation.resultName)").accessibilityLabel("复制\(state.operation.resultName)").disabled(!state.complete)
                 }
             }.font(.system(size: 11)).buttonStyle(.borderless).tint(accent)
                 .padding(.horizontal, 18).frame(height: TranslationWindowLayout.footerHeight)
@@ -340,13 +427,27 @@ final class TranslationPanel: NSPanel {
     }
 }
 
+enum SelectionEntryAppearance {
+    static let cornerRadius: CGFloat = 12
+    static func background(hovered: Bool) -> NSColor {
+        NSColor(calibratedRed: hovered ? 0.25 : 0.29, green: hovered ? 0.29 : 0.34, blue: 0.86, alpha: 1)
+    }
+}
+
 final class HoverButton: NSView {
     var trigger: (() -> Void)?
+    var operation: TextOperation = .translation {
+        didSet { updateActionLabel(); needsDisplay = true }
+    }
+    private func updateActionLabel() {
+        let label = "\(operation.action)选中文字，移入即\(operation.action)，也可点击"
+        setAccessibilityLabel(label); toolTip = label
+    }
     private var tracking: NSTrackingArea?
     private var hovering = false
     override init(frame: NSRect) {
         super.init(frame: frame)
-        setAccessibilityElement(true); setAccessibilityRole(.button); setAccessibilityLabel("翻译选中文字，移入即翻译，也可点击")
+        setAccessibilityElement(true); setAccessibilityRole(.button); updateActionLabel()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func updateTrackingAreas() {
@@ -356,9 +457,9 @@ final class HoverButton: NSView {
         addTrackingArea(area); tracking = area
     }
     override func draw(_ dirtyRect: NSRect) {
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 12, yRadius: 12)
-        NSColor(calibratedRed: hovering ? 0.25 : 0.29, green: hovering ? 0.29 : 0.34, blue: 0.86, alpha: 1).setFill(); path.fill()
-        let text: NSString = "译"
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: SelectionEntryAppearance.cornerRadius, yRadius: SelectionEntryAppearance.cornerRadius)
+        SelectionEntryAppearance.background(hovered: hovering).setFill(); path.fill()
+        let text = operation.selectionMark as NSString
         let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 19, weight: .semibold), .foregroundColor: NSColor.white]
         let size = text.size(withAttributes: attrs)
         text.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2), withAttributes: attrs)
@@ -384,6 +485,7 @@ final class FloatingController {
     var onClose: (() -> Void)?
     var onRetryService: ((TranslationServiceID) -> Void)?
     var onRetry: (() -> Void)?
+    var onSwitchAction: ((TextOperation, UUID) -> Void)?
     var onSettings: (() -> Void)?
     var onModelMenuTracking: ((Bool) -> Void)?
     var onSelectModel: ((TranslationChoice, UUID) -> Void)?
@@ -392,6 +494,7 @@ final class FloatingController {
     private(set) var modelMenuTracking = false
     private var modelPickerTracking = false
     private var textMenuTracking = false
+    private var actionMenuTracking = false
     private var menuClosingThisTurn = false
     private var lastMenuClosedAt: TimeInterval = 0
     private var stateSubscription: AnyCancellable?
@@ -423,7 +526,7 @@ final class FloatingController {
         resultPanel.onCancel = { [weak self] in
             guard let self = self else { return }
             if self.modelMenuTracking {
-                ModelMenuButton.cancelPresentedMenu(); TranslationResultTextView.cancelPresentedMenu()
+                Self.cancelResultMenus()
             }
             else {
                 let forwardedEscape = NSApp.currentEvent.map { $0.type == .keyDown && $0.keyCode == 53 && $0.timestamp <= self.lastMenuClosedAt } ?? false
@@ -441,7 +544,7 @@ final class FloatingController {
         }
         resultPanel.contentView = NSHostingView(rootView: TranslationCard(state: state, close: { [weak self] in self?.onClose?() }, retry: { [weak self] in self?.onRetry?() }, settings: { [weak self] in self?.onSettings?() }, modelMenuTracking: { [weak self] tracking in
             self?.handleModelMenuTracking(tracking)
-        }, selectModel: { [weak self] choice, id in self?.onSelectModel?(choice, id) }, restoreModel: { [weak self] id in self?.onRestoreModel?(id) }, loadModels: { [weak self] id in self?.onLoadModels?(id) }, togglePin: { [weak self] in self?.state.pinned.toggle() }, retryService: { [weak self] in self?.onRetryService?($0) }))
+        }, selectModel: { [weak self] choice, id in self?.onSelectModel?(choice, id) }, restoreModel: { [weak self] id in self?.onRestoreModel?(id) }, loadModels: { [weak self] id in self?.onLoadModels?(id) }, togglePin: { [weak self] in self?.state.pinned.toggle() }, retryService: { [weak self] in self?.onRetryService?($0) }, switchAction: { [weak self] operation, id in self?.onSwitchAction?(operation, id) }))
         stateSubscription = state.objectWillChange.sink { [weak self] _ in
             guard let self = self, !self.resizeScheduled else { return }
             self.resizeScheduled = true
@@ -464,12 +567,16 @@ final class FloatingController {
         modelPickerTracking = tracking
         updateMenuTracking()
     }
+    func handleActionMenuTracking(_ tracking: Bool) {
+        actionMenuTracking = tracking
+        updateMenuTracking()
+    }
     private func handleTextMenuTracking(_ tracking: Bool) {
         textMenuTracking = tracking
         updateMenuTracking()
     }
     private func updateMenuTracking() {
-        let tracking = modelPickerTracking || textMenuTracking
+        let tracking = modelPickerTracking || textMenuTracking || actionMenuTracking
         guard modelMenuTracking != tracking else { return }
         modelMenuTracking = tracking
         // Native menus use the pop-up menu level. Let them cover the card only
@@ -483,25 +590,34 @@ final class FloatingController {
         }
         onModelMenuTracking?(tracking)
     }
-    func offerAutomaticTranslation(for text: String, position: ButtonPosition, preserveResult: Bool = false) {
-        guard TextPolicy.shouldOfferAutomaticTranslation(text) else {
+    func offerAutomaticTranslation(for text: String, position: ButtonPosition, preserveResult: Bool = false, polishingEnabled: Bool = true, translationEnabled: Bool = true) {
+        guard let operation = TextPolicy.automaticSelectionOperation(text), operation == .polishing ? polishingEnabled : translationEnabled else {
             if preserveResult { hideButton() } else { hide() }
             return
         }
+        hoverButton.operation = operation
         showButton(position: position, preserveResult: preserveResult)
     }
     func showButton(position: ButtonPosition, preserveResult: Bool = false) {
         guard !SelectionMonitor.isLeftMouseDown else { hideButton(); return }
         if !preserveResult { hide() }
-        let point = clamp(position.origin(relativeTo: NSEvent.mouseLocation, size: buttonPanel.frame.size), size: buttonPanel.frame.size)
+        let mouse = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else { return }
+        let point = position.placedOrigin(relativeTo: mouse, size: buttonPanel.frame.size, screen: screen.visibleFrame)
         buttonPanel.setFrameOrigin(point); buttonPanel.orderFrontRegardless()
     }
-    func showResult(source: String, preview: Bool = false, keepPosition: Bool = false, position: TranslationWindowPosition = .upperRight) {
+    func showResult(sessionID: UUID = UUID(), preview: Bool = false, keepPosition: Bool = false, position: TranslationWindowPosition = .upperRight,
+                    operation: TextOperation = .translation, loadingMessage: String? = nil) {
         let reposition = (!keepPosition && !state.pinned) || !resultPanel.isVisible
         hoverButton.cancelHover(); buttonPanel.orderOut(nil)
-        state.source = source; state.text = ""; state.services = []; state.error = false; state.loading = !preview; state.complete = false
+        state.operation = operation
+        state.loadingMessage = loadingMessage
+        resultPanel.title = "轻译\(operation.resultName)"
+        resultPanel.setAccessibilityTitle("轻译\(operation.resultName)")
+        state.sessionID = sessionID; state.resultActions = []
+        state.text = ""; state.services = []; state.error = false; state.loading = !preview; state.complete = false
         if preview { state.services = []; state.modelSelectionEnabled = false; state.choice = nil; state.defaultChoice = nil; state.temporaryModel = false }
-        state.status = preview ? "界面预览 · 未调用模型" : "正在翻译 · ChatGPT"
+        state.status = preview ? "界面预览 · 未调用模型" : "正在\(operation.action)"
         if reposition {
             placement = position; anchorPointer = NSEvent.mouseLocation; manualTopLeft = nil
             placementScreen = (NSScreen.screens.first { $0.frame.contains(anchorPointer) } ?? NSScreen.main)?.visibleFrame ?? placementScreen
@@ -510,17 +626,22 @@ final class FloatingController {
         resultPanel.orderFrontRegardless()
         if preview { resultPanel.makeKeyAndOrderFront(nil) }
     }
+    static func cancelResultMenus() {
+        ModelMenuButton.cancelPresentedMenu()
+        TranslationResultTextView.cancelPresentedMenu()
+        ResultActionButtonRow.presentedMenu?.cancelTrackingWithoutAnimation()
+    }
     func hide() {
-        ModelMenuButton.cancelPresentedMenu(); TranslationResultTextView.cancelPresentedMenu()
+        Self.cancelResultMenus()
         hoverButton.cancelHover(); buttonPanel.orderOut(nil); resultPanel.orderOut(nil)
-        state.source = ""; state.text = ""; state.complete = false; state.services = []
+        state.resultActions = []; state.text = ""; state.complete = false; state.services = []
         state.sessionID = UUID(); state.modelSelectionEnabled = false; state.choice = nil; state.defaultChoice = nil
         state.temporaryModel = false; state.modelMenuMessage = ""; state.loadingChatGPTModels = false
         state.pinned = false; manualTopLeft = nil
     }
     // Hiding for capture must retain the session, pin, geometry and retry source.
     func concealForScreenshot() -> Bool {
-        ModelMenuButton.cancelPresentedMenu(); TranslationResultTextView.cancelPresentedMenu()
+        Self.cancelResultMenus()
         let visible = resultPanel.isVisible
         hoverButton.cancelHover(); buttonPanel.orderOut(nil); resultPanel.orderOut(nil)
         return visible
@@ -533,7 +654,8 @@ final class FloatingController {
         guard (!requireVisible || resultPanel.isVisible), !draggingWindow else { return }
         let height: CGFloat
         if state.services.isEmpty {
-            height = TranslationWindowLayout.contentHeight(source: state.source, text: state.text, error: state.error, fontSize: state.fontSize)
+            height = TranslationWindowLayout.contentHeight(text: state.text, error: state.error, fontSize: state.fontSize,
+                                                          operation: state.operation, loadingMessage: state.loadingMessage)
         } else {
             let body = ServiceResultsBody(state: state, retry: { _ in }, modelMenuTracking: { _ in }, selectModel: { _, _ in }, restoreModel: { _ in }, loadModels: { _ in })
             let host = NSHostingView(rootView: body)
@@ -553,9 +675,5 @@ final class FloatingController {
     }
     nonisolated static func clamped(_ point: NSPoint, size: NSSize, screen: NSRect, inset: CGFloat = 10) -> NSPoint {
         NSPoint(x: max(screen.minX + inset, min(point.x, screen.maxX - size.width - inset)), y: max(screen.minY + inset, min(point.y, screen.maxY - size.height - inset)))
-    }
-    private func clamp(_ point: NSPoint, size: NSSize) -> NSPoint {
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main ?? NSScreen.screens.first else { return point }
-        return Self.clamped(point, size: size, screen: screen.visibleFrame)
     }
 }

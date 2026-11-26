@@ -6,7 +6,7 @@ extension QingyiTests {
     @MainActor static func builtinTranslationTests() async {
         await asyncCheck("Multi-service streaming growth updates the native scroll extent and can reach the bottom") {
             let controller = FloatingController()
-            controller.showResult(source: "Scrolling regression fixture")
+            controller.showResult()
             controller.state.services = [ServiceTranslationResult(id: .ai)]
             defer { controller.hide() }
             try await Task.sleep(nanoseconds: 100_000_000)
@@ -33,7 +33,14 @@ extension QingyiTests {
             controller.state.services[0].result.text += "\n继续追加的译文"
             try await Task.sleep(nanoseconds: 100_000_000)
             try expect(abs(scroll.contentView.bounds.minY - previousOffset) < 2, "Streaming must preserve the reading position")
-            controller.showResult(source: "New short translation")
+            let longResults = controller.state.services
+            controller.showResult(operation: .custom(AIAction(name: "总结", prompt: "总结原文")))
+            controller.state.services = longResults
+            try await Task.sleep(nanoseconds: 100_000_000)
+            guard let switched = findScroll(root) else { throw QingyiError.message("Missing switched action scroll view") }
+            try expect(switched.hasVerticalScroller && switched.contentView.bounds.minY == 0,
+                       "Switching actions on the same source must start the new long result at the top")
+            controller.showResult()
             controller.state.services = [ServiceTranslationResult(id: .youdao, loading: false, result: .init(text: "简短译文"))]
             try await Task.sleep(nanoseconds: 100_000_000)
             guard let nextScroll = findScroll(root) else { throw QingyiError.message("Missing replacement scroll view") }
@@ -205,6 +212,9 @@ extension QingyiTests {
                 }
                 throw QingyiError.message("Unexpected request")
             }
+            app.screenshotClipboardFixture("  \n")
+            try expect(app.floating.state.error && app.floating.state.services.isEmpty && allRequests == 0)
+            try expect(app.floating.state.text == "剪贴板中没有可翻译的文字。请先复制文字，再按翻译快捷键，或从菜单栏选择“翻译已复制文字”。")
             app.screenshotClipboardFixture("resilience")
             for _ in 0..<150 where app.floating.state.loading { try await Task.sleep(nanoseconds: 10_000_000) }
             try expect(aiRequests == 1 && app.floating.state.services.count == 3)
@@ -227,6 +237,10 @@ extension QingyiTests {
             app.screenshotClipboardFixture("word")
             for _ in 0..<150 where app.floating.state.loading { try await Task.sleep(nanoseconds: 10_000_000) }
             try expect(aiRequests == 1 && app.floating.state.services.count == 2)
+            settings.youdao = false; settings.google = false
+            app.screenshotClipboardFixture("No usable services")
+            try expect(app.floating.state.error && app.floating.state.services.isEmpty)
+            try expect(app.floating.state.text == "在“设置 → 翻译”中开启有道翻译或谷歌翻译。要使用 AI 翻译，请开启“AI 翻译”并选好模型。")
         }
         await asyncCheck("New selection and disable cancel the old provider task; copy uses the selected result") {
             let domain = "qingyi-service-cancel-" + UUID().uuidString
@@ -306,14 +320,13 @@ extension QingyiTests {
 }
 
 extension QingyiTests {
-    @MainActor static func renderBuiltinUI(to directory: String, recognized: String) throws {
+    @MainActor static func renderBuiltinUI(to directory: String) throws {
         let url = URL(fileURLWithPath: directory, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         for name in ["services-light", "services-dark", "screenshot-ocr"] {
             let dark = name == "services-dark"
             let ocr = name == "screenshot-ocr"
             let state = FloatingState()
-            state.source = "Small steps make complex things easier to understand."
             state.loading = false; state.complete = true
             state.services = [
                 ServiceTranslationResult(id: .youdao, loading: false, result: .init(text: "一小步一小步地走，会让复杂的事情更容易理解。")),
@@ -321,14 +334,12 @@ extension QingyiTests {
                 ServiceTranslationResult(id: .ai, loading: false, result: .init(text: "循序渐进，复杂的事情也会变得更容易理解。"))
             ]
             if dark {
-                state.source = "resilience"
                 state.services = [
                     ServiceTranslationResult(id: .youdao, loading: false, result: .init(text: "恢复力", phonetics: ["英 /rɪˈzɪliəns/"], meanings: [.init(part: "n.", text: "恢复力，复原力；（橡胶等的）弹性")])),
                     ServiceTranslationResult(id: .google, loading: false, result: .init(text: "弹性", meanings: [.init(part: "noun", text: "弹性；弹力")]))
                 ]
             }
             if ocr {
-                state.source = recognized
                 state.services.removeAll { $0.id == .ai }
             }
             let target = TranslationTarget(service: .customAPI("fixture"), modelID: "fixture-model")
@@ -371,7 +382,7 @@ final class NativeServiceScrollFixture: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     func applicationDidFinishLaunching(_ notification: Notification) {
         controller.onClose = { NSApp.terminate(nil) }
-        controller.showResult(source: "Long translation scrolling fixture")
+        controller.showResult()
         controller.state.pinned = true
         controller.state.services = TranslationServiceID.allCases.map { ServiceTranslationResult(id: $0) }
         controller.resultPanel.makeKeyAndOrderFront(nil)

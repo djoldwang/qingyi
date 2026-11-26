@@ -6,7 +6,7 @@ struct ServiceTranslationResult: Identifiable, Equatable {
     let id: TranslationServiceID
     var runID = UUID()
     var loading = true
-    var retryingWithDefault = false
+    var retryingEmptyResponse = false
     var error: String?
     var result = BuiltinTranslationResult(text: "")
 
@@ -35,8 +35,6 @@ struct ServiceResultsBody: View {
     @ViewState private var copied: TranslationServiceID?
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(state.source).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(3)
-                .frame(maxWidth: .infinity, alignment: .leading).padding(18)
             VStack(spacing: 12) {
                 ForEach(state.services) { service in
                     VStack(alignment: .leading, spacing: 0) {
@@ -44,7 +42,8 @@ struct ServiceResultsBody: View {
                             Text(service.id.mark).font(.system(size: 12, weight: .semibold))
                                 .frame(width: 27, height: 27).foregroundStyle(service.id.color)
                                 .background(service.id.color.opacity(0.13), in: RoundedRectangle(cornerRadius: 7))
-                            Text(service.id.name).font(.system(size: 13, weight: .semibold)).fixedSize()
+                            Text(state.operation.serviceName(service.id)).font(.system(size: 13, weight: .semibold))
+                                .lineLimit(1).truncationMode(.tail).help(state.operation.serviceName(service.id))
                             Spacer(minLength: 0)
                             if service.id == .ai {
                                 TemporaryModelPicker(state: state, tracking: modelMenuTracking, select: selectModel, restore: restoreModel, load: loadModels)
@@ -58,7 +57,7 @@ struct ServiceResultsBody: View {
                         HStack {
                             Spacer()
                             if service.error != nil {
-                                Button("重试") { retry(service.id) }
+                                Button("重试") { retry(service.id) }.disabled(!state.actionAvailable)
                             } else {
                                 Button {
                                     service.copy(to: .general)
@@ -66,7 +65,7 @@ struct ServiceResultsBody: View {
                                 } label: {
                                     Label(copied == service.id ? "已复制" : "复制", systemImage: "doc.on.doc")
                                 }.disabled(service.loading)
-                                    .accessibilityLabel("复制\(service.id.name)结果")
+                                    .accessibilityLabel("复制\(state.operation.serviceName(service.id))结果")
                             }
                         }.font(.system(size: 11)).buttonStyle(.borderless)
                             .padding(.horizontal, 14).padding(.bottom, 10).padding(.top, 4)
@@ -85,12 +84,12 @@ struct ServiceResultsBody: View {
     }
     @ViewBuilder private func serviceBody(_ service: ServiceTranslationResult) -> some View {
         if let error = service.error {
-            let message = service.retryingWithDefault ? "默认模式重试未成功。\(error)" : error
+            let message = service.retryingEmptyResponse ? "按原设置重试未成功。\(error)" : error
             Label(message, systemImage: "exclamationmark.circle").font(.system(size: 12)).foregroundStyle(.orange).textSelection(.enabled)
         } else if service.loading && service.result.text.isEmpty {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.mini)
-                Text(service.retryingWithDefault ? "正在用模型默认模式重试…" : "正在翻译…").font(.system(size: 12)).foregroundStyle(.secondary)
+                Text(service.retryingEmptyResponse ? "未收到正文，正在按原设置重试…" : "正在\(state.operation.action)…").font(.system(size: 12)).foregroundStyle(.secondary)
             }
         } else {
             VStack(alignment: .leading, spacing: 9) {
@@ -103,7 +102,7 @@ struct ServiceResultsBody: View {
                         }
                     }
                 } else {
-                    TranslationResultText(text: service.result.text, dark: colorScheme == .dark, fontSize: state.fontSize)
+                    TranslationResultText(text: service.result.text, dark: colorScheme == .dark, fontSize: state.fontSize, operation: state.operation)
                 }
             }
         }
@@ -119,38 +118,30 @@ struct ServicesScrollArea: NSViewRepresentable {
     }
     func makeNSView(context: Context) -> TranslationBodyScrollView { TranslationBodyScrollView() }
     func updateNSView(_ view: TranslationBodyScrollView, context: Context) {
-        view.updateServices(bodyView, source: state.source)
+        view.updateServices(bodyView, sessionID: state.sessionID)
     }
 }
 
 struct TranslationServicesListView: View {
     @ObservedObject var store: BuiltinTranslationSettings
     @ViewState private var dragging: TranslationServiceID?
+    @ViewState private var rowWidth: CGFloat = 500
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             SettingsGroup(title: "翻译服务") {
                 ForEach(store.order) { service in
                     if service != store.order.first { Divider() }
-                    SettingsRow {
-                        Text(service.mark).font(.system(size: 12, weight: .semibold))
-                            .frame(width: 26, height: 26).foregroundStyle(service.color)
-                            .background(service.color.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
-                        Text(service.name)
-                        Spacer()
-                        switch service {
-                        case .youdao:
-                            Toggle("启用有道翻译", isOn: $store.youdao).labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
-                        case .google:
-                            Toggle("启用谷歌翻译", isOn: $store.google).labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
-                        case .ai:
-                            Toggle("启用 AI 翻译", isOn: $store.ai).labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
-                        }
-                    }
+                    TranslationServiceRow(service: service, store: store)
+                    .background(GeometryReader { geometry in
+                        Color.clear.onAppear { rowWidth = geometry.size.width }
+                            .onChange(of: geometry.size.width) { _, width in rowWidth = width }
+                    })
                     .contentShape(Rectangle())
-                    .contentShape(.dragPreview, RoundedRectangle(cornerRadius: 9))
                     .onDrag {
                         dragging = service
                         return NSItemProvider(object: service.rawValue as NSString)
+                    } preview: {
+                        TranslationServiceDragPreview(service: service, store: store, width: rowWidth)
                     }
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel("拖动\(service.name)调整顺序")
@@ -159,8 +150,43 @@ struct TranslationServicesListView: View {
                     .onDrop(of: [UTType.text], delegate: ServiceOrderDrop(target: service, store: store, dragging: $dragging))
                 }
             }
-            Text("开启的服务参与翻译，拖动服务行可调整译文显示顺序。").font(.system(size: 11)).foregroundStyle(.secondary)
+            Text("开启的服务参与翻译，拖动可调整显示顺序。中文划词润色始终只用 AI，不受 AI 翻译开关影响。").font(.system(size: 11)).foregroundStyle(.secondary)
         }
+    }
+}
+
+struct TranslationServiceRow: View {
+    let service: TranslationServiceID
+    @ObservedObject var store: BuiltinTranslationSettings
+    var body: some View {
+        SettingsRow {
+            Text(service.mark).font(.system(size: 12, weight: .semibold))
+                .frame(width: 26, height: 26).foregroundStyle(service.color)
+                .background(service.color.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+            Text(service.name)
+            Spacer()
+            switch service {
+            case .youdao:
+                Toggle("启用有道翻译", isOn: $store.youdao).labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
+            case .google:
+                Toggle("启用谷歌翻译", isOn: $store.google).labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
+            case .ai:
+                Toggle("启用 AI 翻译", isOn: $store.ai).labelsHidden().toggleStyle(.switch).controlSize(.small).settingsAction()
+            }
+        }
+    }
+}
+
+struct TranslationServiceDragPreview: View {
+    let service: TranslationServiceID
+    @ObservedObject var store: BuiltinTranslationSettings
+    let width: CGFloat
+    var body: some View {
+        TranslationServiceRow(service: service, store: store).frame(width: width)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 9))
+            .shadow(color: .black.opacity(0.24), radius: 10, x: 0, y: 4)
+            .padding(18).allowsHitTesting(false)
     }
 }
 

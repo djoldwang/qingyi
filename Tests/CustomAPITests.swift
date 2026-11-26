@@ -70,20 +70,37 @@ extension QingyiTests {
         try store.selectProvider(provider.id)
         let url = URL(fileURLWithPath: directory, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        func render<V: View>(_ view: V, name: String, size: NSSize, dark: Bool = false) throws {
+        func capture(_ view: NSView, name: String) throws {
+            view.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+            guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw QingyiError.message("Unable to render UI") }
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            guard let data = bitmap.representation(using: .png, properties: [:]) else { throw QingyiError.message("Unable to encode UI") }
+            try data.write(to: url.appendingPathComponent(name))
+        }
+        func render<V: View>(_ view: V, name: String, size: NSSize, dark: Bool = false, sample: SelectionTrialSample? = nil, showModifierActions: Bool = false) throws {
             let hosting = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)).environment(\.controlActiveState, .active).environment(\.colorScheme, dark ? .dark : .light))
             hosting.frame = NSRect(origin: .zero, size: size)
             hosting.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
-            let window = NSWindow(contentRect: hosting.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            let window: NSWindow = showModifierActions
+                ? NSPanel(contentRect: hosting.frame, styleMask: [.titled, .nonactivatingPanel], backing: .buffered, defer: false)
+                : NSWindow(contentRect: hosting.frame, styleMask: [.borderless], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
             window.contentView = hosting
-            hosting.layoutSubtreeIfNeeded()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
-            guard let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else { throw QingyiError.message("Unable to render UI") }
-            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
-            guard let data = bitmap.representation(using: .png, properties: [:]) else { throw QingyiError.message("Unable to encode UI") }
-            try data.write(to: url.appendingPathComponent(name))
-            window.close()
+            defer { window.close() }
+            if let sample { try selectTrialSample(sample, in: hosting) }
+            if showModifierActions {
+                window.makeKeyAndOrderFront(nil)
+                hosting.layoutSubtreeIfNeeded()
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                guard window.isKeyWindow, let press = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: .option,
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                    context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 58) else {
+                    throw QingyiError.message("Unable to open the sample action toolbar")
+                }
+                NSApp.sendEvent(press)
+            }
+            try capture(hosting, name: name)
         }
         let screenshot = QingyiTests.screenshotImage()
         try NSBitmapImageRep(cgImage: screenshot).representation(using: .png, properties: [:])!.write(to: url.appendingPathComponent("ocr-english-sample.png"))
@@ -99,6 +116,7 @@ extension QingyiTests {
         settingsPreferences.trusted = true
         settingsPreferences.hoverEnabled = true
         settingsPreferences.excluded = ["com.apple.Notes", "com.apple.Terminal"]
+        try store.textSettings.saveAction(AIAction(name: "总结", prompt: "概括选中文字的主要观点。"))
         let settingsChat = ChatGPT(defaults: defaults)
         func settings(_ section: SettingsSection, detail: SettingsDetail? = nil) -> SettingsView {
             SettingsView(preferences: settingsPreferences, chat: settingsChat, api: store,
@@ -109,6 +127,40 @@ extension QingyiTests {
             try render(settings(section), name: "settings-\(section.rawValue)-light.png", size: NSSize(width: 900, height: 680))
             try render(settings(section), name: "settings-\(section.rawValue)-dark.png", size: NSSize(width: 900, height: 680), dark: true)
             try render(settings(section), name: "settings-\(section.rawValue)-minimum.png", size: NSSize(width: 780, height: 600))
+            if section == .prompts {
+                try render(settings(section), name: "settings-\(section.rawValue)-minimum-dark.png", size: NSSize(width: 780, height: 600), dark: true)
+            }
+        }
+        try render(settings(.selection), name: "settings-selection-modifier-default.png", size: NSSize(width: 900, height: 680), showModifierActions: true)
+        settingsPreferences.selectionMode = .toolbar
+        try render(settings(.selection), name: "settings-selection-toolbar-below-dark.png", size: NSSize(width: 780, height: 600), dark: true)
+        settingsPreferences.actionBarPosition = .above
+        try render(settings(.selection), name: "settings-selection-toolbar-above.png", size: NSSize(width: 900, height: 680))
+        store.textSettings.polishingEnabled = true
+        try render(settings(.selection), name: "settings-selection-toolbar-chinese.png", size: NSSize(width: 780, height: 600), sample: .chinese)
+        store.textSettings.polishingEnabled = false
+        settingsPreferences.selectionMode = .compact
+        try render(SettingsView(preferences: Preferences(defaults: freshDefaults), chat: settingsChat,
+                                api: APIConfigurationStore(defaults: freshDefaults, vault: MemoryAPIKeyVault()),
+                                navigation: SettingsNavigation(), updateShortcut: { _ in true }, shortcutRecording: { _ in },
+                                preview: {}, verify: {}, loadsAccounts: false),
+                   name: "settings-selection-fresh-chinese.png", size: NSSize(width: 780, height: 600), sample: .chinese)
+        settingsPreferences.translationWindowPosition = .upperLeft
+        settingsPreferences.translationFontSize = TranslationFontSize.range.lowerBound
+        try render(settings(.window), name: "settings-window-upper-left-small.png", size: NSSize(width: 780, height: 600), dark: true)
+        settingsPreferences.translationWindowPosition = .belowPointer
+        settingsPreferences.translationFontSize = TranslationFontSize.range.upperBound
+        try render(settings(.window), name: "settings-window-below-pointer-large.png", size: NSSize(width: 780, height: 600))
+        settingsPreferences.translationWindowPosition = .upperRight
+        settingsPreferences.translationFontSize = TranslationFontSize.standard
+        do {
+            let previewApp = AppDelegate(preferences: settingsPreferences)
+            previewApp.showPreview()
+            defer { previewApp.floating.hide() }
+            let panel = previewApp.floating.resultPanel
+            panel.appearance = NSAppearance(named: .aqua)
+            guard let content = panel.contentView else { throw QingyiError.message("Missing result preview") }
+            try capture(content, name: "settings-window-floating-preview.png")
         }
         settingsPreferences.trusted = false
         try render(settings(.selection), name: "settings-permission-denied.png", size: NSSize(width: 780, height: 600))
@@ -117,12 +169,11 @@ extension QingyiTests {
         try render(settings(.services, detail: .api(provider)), name: "settings-api-inline.png", size: NSSize(width: 900, height: 680))
         try render(settings(.services, detail: .api(provider)), name: "settings-api-inline-dark.png", size: NSSize(width: 780, height: 600), dark: true)
         let floating = FloatingState()
-        floating.source = "Small steps make complex things easier to understand."
         floating.text = "一步一步来，复杂的事情也能变得容易理解。"
         floating.complete = true; floating.status = "已完成"; floating.modelSelectionEnabled = true
         floating.choice = TranslationChoice(target: .init(service: .customAPI(provider.id), modelID: "long-model-name"), providerName: "我的 API 服务", modelName: "一个用于验证截断行为的很长模型显示名称")
         floating.temporaryModel = true
-        let shortSize = NSSize(width: TranslationWindowLayout.width, height: TranslationWindowLayout.contentHeight(source: floating.source, text: floating.text))
+        let shortSize = NSSize(width: TranslationWindowLayout.width, height: TranslationWindowLayout.contentHeight(text: floating.text))
         try render(TranslationCard(state: floating, close: {}, retry: {}, settings: {}), name: "temporary-model-light.png", size: shortSize)
         try render(TranslationCard(state: floating, close: {}, retry: {}, settings: {}), name: "temporary-model-dark.png", size: shortSize, dark: true)
         floating.pinned = true
@@ -131,8 +182,8 @@ extension QingyiTests {
         try render(TranslationCard(state: floating, close: {}, retry: {}, settings: {}), name: "translation-long.png", size: NSSize(width: TranslationWindowLayout.width, height: 680))
         floating.error = true; floating.complete = false; floating.status = "翻译未完成"
         floating.text = "API 密钥无效或已过期，请编辑提供商配置。（HTTP 401）"
-        try render(TranslationCard(state: floating, close: {}, retry: {}, settings: {}), name: "temporary-model-error.png", size: NSSize(width: TranslationWindowLayout.width, height: TranslationWindowLayout.contentHeight(source: floating.source, text: floating.text, error: true)))
-        try render(TranslationCard(state: floating, close: {}, retry: {}, settings: {}), name: "temporary-model-error-dark.png", size: NSSize(width: TranslationWindowLayout.width, height: TranslationWindowLayout.contentHeight(source: floating.source, text: floating.text, error: true)), dark: true)
+        try render(TranslationCard(state: floating, close: {}, retry: {}, settings: {}), name: "temporary-model-error.png", size: NSSize(width: TranslationWindowLayout.width, height: TranslationWindowLayout.contentHeight(text: floating.text, error: true)))
+        try render(TranslationCard(state: floating, close: {}, retry: {}, settings: {}), name: "temporary-model-error-dark.png", size: NSSize(width: TranslationWindowLayout.width, height: TranslationWindowLayout.contentHeight(text: floating.text, error: true)), dark: true)
         floating.error = false; floating.pinned = false; floating.temporaryModel = false
         floating.choice = TranslationChoice(target: .init(service: .customAPI(provider.id), modelID: "deepseek-v4-flash"), providerName: "NewAPI-DeepSeekFlash", modelName: "deepseek-v4-flash")
         floating.text = "一步一步来，复杂的事情也能变得容易理解。"
@@ -141,7 +192,7 @@ extension QingyiTests {
             try render(TranslationCard(state: floating, close: {}, retry: {}, settings: {}), name: "compact-complete-\(dark ? "dark" : "light").png", size: shortSize, dark: dark)
         }
         floating.text = ""; floating.status = "正在翻译"; floating.loading = true; floating.complete = false
-        let loadingSize = NSSize(width: TranslationWindowLayout.width, height: TranslationWindowLayout.contentHeight(source: floating.source, text: ""))
+        let loadingSize = NSSize(width: TranslationWindowLayout.width, height: TranslationWindowLayout.contentHeight(text: ""))
         for dark in [false, true] {
             try render(TranslationCard(state: floating, close: {}, retry: {}, settings: {}), name: "compact-loading-\(dark ? "dark" : "light").png", size: loadingSize, dark: dark)
         }
@@ -154,17 +205,21 @@ extension QingyiTests {
         try store.save(fastProvider, replacementKey: "fixture-only")
         try store.selectProvider(fastProvider.id)
         let key = ModelReasoningKey(provider: fastProvider, modelID: fastProvider.models[0].id)
+        store.setThinkingMode(false, for: key)
         store.recordThinkingStatus(.requestedOffUnconfirmed, for: key)
         try render(settings(.services), name: "settings-fast-translation.png", size: NSSize(width: 900, height: 680))
-        store.setFastTranslation(false, for: key)
+        store.setThinkingMode(true, for: key)
         store.recordThinkingStatus(.usedThinking, for: key)
+        try render(settings(.services), name: "settings-thinking-used.png", size: NSSize(width: 900, height: 680))
         try render(settings(.services), name: "settings-fast-translation-dark.png", size: NSSize(width: 780, height: 600), dark: true)
-        store.setFastTranslation(true, for: key)
-        store.recordThinkingStatus(.usedThinking, for: key, usedDefaultRetry: true)
-        try render(settings(.services), name: "settings-default-retry.png", size: NSSize(width: 780, height: 600))
-        store.rememberFastTranslationRejection(for: key, generation: store.fastTranslationRejectionGeneration(for: key))
-        store.recordThinkingStatus(.unreported, for: key)
-        try render(settings(.services), name: "settings-remembered-gateway.png", size: NSSize(width: 860, height: 680))
+        store.setThinkingMode(false, for: key)
+        store.recordThinkingStatus(.requestedOffUnconfirmed, for: key, retry: .emptyResponse)
+        try render(settings(.services), name: "settings-empty-retry.png", size: NSSize(width: 780, height: 600))
+        store.setThinkingMode(true, for: key)
+        store.recordThinkingStatus(.requestedOnUnconfirmed, for: key)
+        try render(settings(.services), name: "settings-thinking-on.png", size: NSSize(width: 860, height: 680))
+        try store.selectProvider("")
+        try render(settings(.services), name: "settings-chatgpt-disconnected.png", size: NSSize(width: 780, height: 600))
     }
     @MainActor static func asyncCheck(_ name: String, _ body: () async throws -> Void) async {
         do { try await body(); passed += 1; print("PASS \(name)") }
@@ -323,14 +378,23 @@ extension QingyiTests {
             for value in [
                 "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
                 #"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#,
-                #"{"choices":[{"message":{"content":"hidden","refusal":"denied"},"finish_reason":"stop"}]}"#,
                 "data: [DONE]\n\n", "<html>proxy failure</html>"
             ] { try rejects { _ = try feed(value, protocol: .chatCompletions) } }
+            do {
+                _ = try feed(#"{"choices":[{"message":{"content":"hidden","refusal":"denied"},"finish_reason":"stop"}]}"#, protocol: .chatCompletions)
+                throw QingyiError.message("Expected model refusal")
+            } catch TranslationRequestError.refused {
+                try expect(TranslationRequestError.refused.localizedDescription == "模型拒绝了本次请求。")
+            }
         }
         check("Anthropic SSE and JSON require message_stop and valid stop_reason, hide thinking") {
             let body = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\",\"thinking\":\"hidden\"}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"译文\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
             try expect(try feed(body, protocol: .anthropic) == "译文")
             try expect(try feed(#"{"content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"译文"}],"stop_reason":"end_turn"}"#, protocol: .anthropic) == "译文")
+            do {
+                _ = try feed(#"{"content":[],"stop_reason":"refusal"}"#, protocol: .anthropic)
+                throw QingyiError.message("Expected model refusal")
+            } catch TranslationRequestError.refused {}
             for value in [
                 #"{"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"}"#,
                 "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
