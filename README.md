@@ -8,7 +8,7 @@
 
 读英文文档时，把几家译文摆在一起，挑出最贴合上下文的说法。写中文邮件时，选中草稿，让轻译理顺措辞。开完会，把笔记交给「会议纪要」，原来的编辑窗口始终在手边。
 
-**版本说明**　本页介绍待发布的 1.0.4。GitHub 当前正式版为 [1.0.3](https://github.com/djoldwang/qingyi/releases/tag/v1.0.3)。
+**1.0.4 新增**中文划词润色和自定义 AI 动作。你可以为翻译、润色和会议纪要分别指定模型与提示词。选中一段会议记录后，还能在同一浮窗里先总结讨论，再提取待办。[1.0.4 发行说明与安装包](https://github.com/djoldwang/qingyi/releases/tag/v1.0.4)
 
 ## 读外文，把几种译法放在一起
 
@@ -105,6 +105,6 @@
 | 润色、执行自定义动作 | 选区及提示词只发给该动作所选的 AI。AI 文本任务单次最多 12,000 字。 |
 | 保存配置 | 账号访问凭据及 API 密钥保存在 macOS 钥匙串。动作、模型偏好和提示词保存在本机。 |
 
-自定义 API 支持 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages。模型调用使用你所选服务的额度。有道和谷歌通过各自的网页服务提供译文，其可用性受接口、网络和限流影响。配图使用候选版本的原生界面和独立示例数据。
+自定义 API 支持 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages。模型调用使用你所选服务的额度。有道和谷歌通过各自的网页服务提供译文，其可用性受接口、网络和限流影响。配图使用轻译 1.0.4 的原生界面和独立示例数据。
 
 [使用与排障](docs/usage.md) · [源码构建与测试](docs/usage.md#源码构建与测试) · [第三方服务说明](THIRD_PARTY_NOTICES.md) · [GPL-3.0-only 许可](LICENSE) · [历史版本许可说明](RELICENSING.md)

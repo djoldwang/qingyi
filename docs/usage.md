@@ -1,6 +1,6 @@
 # 轻译使用手册
 
-本手册对应 1.0.4 发布候选。当前正式安装包与各版本发布记录见 [GitHub Releases](https://github.com/djoldwang/qingyi/releases)。
+本手册适用于轻译 1.0.4（构建 109）。[下载 1.0.4 安装包](https://github.com/djoldwang/qingyi/releases/tag/v1.0.4) · [所有版本](https://github.com/djoldwang/qingyi/releases)
 
 ## 安装与权限
 
