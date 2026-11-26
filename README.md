@@ -4,7 +4,7 @@
 
 <p align="center"><strong>在 Mac 上选中文字，就地翻译、润色，或交给你自己的 AI 动作。</strong></p>
 <p align="center">Apple Silicon · macOS 14 或更高版本 · 原生菜单栏应用 · GPL-3.0-only</p>
-<p align="center"><a href="https://github.com/djoldwang/qingyi/releases/latest"><strong>下载当前正式版</strong></a>　·　<a href="docs/usage.md">使用手册</a>　·　<a href="CHANGELOG.md">累计更新记录</a></p>
+<p align="center"><a href="https://djoldwang.github.io/qingyi/">轻译官网</a>　·　<a href="https://github.com/djoldwang/qingyi/releases/latest"><strong>下载当前正式版</strong></a>　·　<a href="docs/usage.md">使用手册</a>　·　<a href="CHANGELOG.md">累计更新记录</a></p>
 
 读英文文档时，把几家译文摆在一起，挑出最贴合上下文的说法。写中文邮件时，选中草稿，让轻译理顺措辞。开完会，把笔记交给「会议纪要」，原来的编辑窗口始终在手边。
 
