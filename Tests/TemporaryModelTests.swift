@@ -399,20 +399,25 @@ extension QingyiTests {
             try expect(loading.items.first { $0.title == "恢复默认模型" }?.isEnabled == false)
             try expect(loading.items.first { $0.title == "正在加载 ChatGPT 模型…" }?.isEnabled == false)
         }
-        check("Selection monitor ignores internal clicks and menu Escape but preserves external close events") {
+        await asyncCheck("Selection monitor ignores internal clicks and menu Escape but preserves external close events") {
             let monitor = SelectionMonitor()
             var outside = 0; var escapes = 0; var menuCancels = 0
             monitor.onOutsideClick = { _ in outside += 1 }; monitor.onScroll = { escapes += 1 }
             monitor.onMenuCancel = { menuCancels += 1 }
             monitor.isInternalInteraction = { _ in true }
             let click = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+            let release = NSEvent.mouseEvent(with: .leftMouseUp, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
             let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53)!
             monitor.event(click)
             try expect(outside == 0)
             monitor.isInternalInteraction = { _ in false }
-            monitor.event(click)
+            monitor.event(release)
+            try expect(outside == 0, "A press inside cannot become an outside click on release")
+            monitor.event(click); monitor.event(release)
+            try await Task.sleep(for: .seconds(NSEvent.doubleClickInterval + 0.1))
             try expect(outside == 1)
-            monitor.setModelMenuTracking(true); monitor.event(click); monitor.event(escape)
+            monitor.event(click)
+            monitor.setModelMenuTracking(true); monitor.event(release); monitor.event(click); monitor.event(escape)
             try expect(outside == 1 && escapes == 0 && menuCancels == 1)
             monitor.setModelMenuTracking(false); monitor.event(escape); monitor.event(click)
             try expect(escapes == 0 && outside == 1)

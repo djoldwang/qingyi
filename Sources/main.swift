@@ -117,12 +117,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.hover.configure(enabled: enabled, trigger: trigger, activation: activation)
         }.store(in: &subscriptions)
         monitor.isInternalInteraction = { [weak self] point in
-            guard let self = self else { return false }
-            // Hit-test the frontmost window rather than its frame: a settings
-            // window behind another app must not suppress that app's selections.
-            let number = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
-            let windows: [NSWindow?] = [self.floating.buttonPanel, self.floating.resultPanel, self.actionPopup.panel, self.settingsWindow]
-            return windows.contains { $0?.isVisible == true && $0?.windowNumber == number }
+            self?.hitsAppWindow(at: point, includeSettings: true) == true
+        }
+        monitor.isResultInteraction = { [weak self] point, window in
+            self?.hitsAppWindow(at: point, eventWindow: window, includeSettings: false) == true
         }
         monitor.onMenuCancel = { [weak self] in
             self?.closeActionPopup()
@@ -416,7 +414,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if monitor.screenshotSuspended { monitor.setScreenshotSuspended(false) }
         if restore { floating.restoreAfterScreenshot(wasVisible: visible) }
     }
+    private func hitsAppWindow(at point: NSPoint, eventWindow: NSWindow? = nil, includeSettings: Bool) -> Bool {
+        var windows: [NSWindow] = [floating.resultPanel, floating.buttonPanel, actionPopup.panel]
+        if includeSettings, let settingsWindow { windows.append(settingsWindow) }
+        if let eventWindow {
+            return windows.contains { $0 === eventWindow || $0 === eventWindow.sheetParent || $0 === eventWindow.parent }
+        }
+        // A covered settings window must not intercept selections from the app in front.
+        let number = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
+        return windows.contains { $0.isVisible && $0.windowNumber == number }
+    }
     private func configureSelectionDismissal() {
+        monitor.isResultVisible = { [weak self] in self?.floating.resultPanel.isVisible == true }
+        monitor.resultDismissalID = { [weak self] in
+            guard let self, !self.floating.state.pinned else { return nil }
+            if self.floating.resultPanel.isVisible { return self.floating.state.sessionID }
+            return self.screenshotID
+        }
         monitor.screenshotWorkPending = { [weak self] in
             guard let self else { return false }
             return self.screenshotTask != nil || (self.translationSession?.origin == .screenshot && self.floating.state.loading && !self.floating.state.pinned)
@@ -430,18 +444,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self, !self.monitor.defersSelectionForScreenshot else { return }
             self.closeActionPopup(); self.actionGesture.cancel()
             self.hover.cancel()
-            if self.hoverSessionActive, !self.floating.state.pinned,
-               NSWorkspace.shared.frontmostApplication?.processIdentifier != getpid() { self.dismiss() }
         }
-        monitor.onOutsideClick = { [weak self] point in
+        monitor.onOutsideClick = { [weak self] _ in
             guard let self, !self.screenshotCapturing else { return }
-            if !self.actionPopup.panel.frame.contains(point) { self.closeActionPopup() }
-            if !self.floating.state.pinned, !self.floating.contains(point) { self.dismiss() }
+            if self.floating.state.pinned { self.closeActionPopup() } else { self.dismiss() }
         }
         monitor.onScroll = { [weak self] in
             guard let self, !self.screenshotCapturing else { return }
             self.closeActionPopup()
-            if !self.floating.state.pinned { self.dismiss() }
+            self.floating.hideButton()
         }
         monitor.onCancel = { [weak self] in
             guard let self else { return }
@@ -492,7 +503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .flagsChanged: kind = .flags
         case .keyDown: kind = .keyDown
         case .keyUp: kind = .keyUp
-        case .leftMouseDown: kind = .leftDown
+        case .leftMouseDown: kind = event.modifierFlags.contains(.control) ? .otherMouseDown : .leftDown
         case .leftMouseUp: kind = .leftUp
         case .scrollWheel: kind = .scroll
         case .rightMouseDown, .otherMouseDown: kind = .otherMouseDown
@@ -598,24 +609,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             closeActionPopup()
             if !invalidatedByInput || preferences.selectionMode == .compact { fingerprint = "" }
             selection = nil
-            if floating.state.pinned { floating.hideButton() } else { dismiss() }
+            floating.hideButton()
             return
         }
         guard !SelectionMonitor.isLeftMouseDown else { closeActionPopup(); floating.hideButton(); return }
         if let id = NSRunningApplication(processIdentifier: snapshot.pid)?.bundleIdentifier, preferences.excluded.contains(id) {
             closeActionPopup(); selection = nil
-            if floating.state.pinned { floating.hideButton() } else { dismiss() }
+            floating.hideButton()
             return
         }
         guard snapshot.fingerprint != fingerprint else { return }
-        if !floating.state.pinned { dismiss() } else { closeActionPopup(); floating.hideButton() }
+        // A selection offers the next action. Starting that action replaces the result.
+        closeActionPopup()
+        floating.hideButton()
         fingerprint = snapshot.fingerprint; selection = snapshot; triggered = false
         if preferences.selectionMode == .toolbar {
             showAutomaticToolbar(for: snapshot)
             return
         }
         if showActionPopupIfReady(pendingModifierActions()) { return }
-        floating.offerAutomaticTranslation(for: snapshot.text, position: preferences.buttonPosition, preserveResult: floating.state.pinned, polishingEnabled: engine.textSettings.polishingEnabled, translationEnabled: engine.textSettings.translationEnabled)
+        floating.offerAutomaticTranslation(for: snapshot.text, position: preferences.buttonPosition, preserveResult: true, polishingEnabled: engine.textSettings.polishingEnabled, translationEnabled: engine.textSettings.translationEnabled)
     }
     private func trigger() {
         guard !triggered, let selection = selection, floating.buttonPanel.isVisible else { return }
@@ -657,7 +670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         HoverDiagnostics.log("read started pid=\(pid)")
         hoverTicket?.cancel()
         let ticket = HoverReadTicket(); hoverTicket = ticket
-        monitor.suppressAutomaticSelectionForHover()
+        monitor.suppressAutomaticSelection()
         fingerprint = ""; selection = nil; triggered = true
         // Keep the existing session until the new paragraph needs translation.
         // A Chinese hover must not invalidate a pinned result or its retry.
@@ -987,7 +1000,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitor.onSelection = { [weak self] in self?.selectionChanged($0) }
     }
     func feedHoverFixture(_ source: String) {
-        monitor.suppressAutomaticSelectionForHover()
+        monitor.suppressAutomaticSelection()
         acceptHoveredParagraph(source)
     }
     func dismissHoverFixture() { dismiss() }

@@ -57,6 +57,10 @@ struct QingyiTests {
         NSApplication.shared.run()
     }
     @MainActor static func runTests() async {
+        if CommandLine.arguments.contains("--result-interaction-tests") {
+            await resultInteractionTests()
+            print("\(passed) passed, \(failed) failed"); exit(failed == 0 ? 0 : 1)
+        }
         if CommandLine.arguments.contains("--prompt-undo-persistence") {
             promptUndoPersistencePhase(); return
         }

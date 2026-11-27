@@ -140,10 +140,11 @@ final class SelectionMonitor {
     }
     func setScreenshotSuspended(_ value: Bool) {
         screenshotSuspended = value; invalidateInternalRead()
+        cancelOutsideClick()
         if !value {
             ignoreEventsThrough = ProcessInfo.processInfo.systemUptime
             screenshotAwaitingFreshInput = true
-            hoverOwnsSelection = true
+            automaticSelectionSuppressed = true
         }
     }
     var onSelection: ((SelectionSnapshot?) -> Void)?
@@ -153,9 +154,11 @@ final class SelectionMonitor {
     var onLocalEvent: ((NSEvent) -> Void)?
     var onContextChanged: (() -> Void)?
     var onInternalEvent: (() -> Void)?
-    private(set) var hoverOwnsSelection = false
-    func suppressAutomaticSelectionForHover() {
-        hoverOwnsSelection = true; invalidateInternalRead()
+    var isResultVisible: (() -> Bool)?
+    private var contextClickTarget: pid_t?
+    private(set) var automaticSelectionSuppressed = false
+    func suppressAutomaticSelection() {
+        automaticSelectionSuppressed = true; invalidateInternalRead()
     }
 
     var onOutsideClick: ((NSPoint) -> Void)?
@@ -163,6 +166,14 @@ final class SelectionMonitor {
     var onCancel: (() -> Void)?
     var onMenuCancel: (() -> Void)?
     var isInternalInteraction: ((NSPoint) -> Bool)?
+    var isResultInteraction: ((NSPoint, NSWindow?) -> Bool)?
+    var resultDismissalID: (() -> UUID?)?
+    private struct OutsideClick {
+        let point: NSPoint
+        let resultID: UUID?
+    }
+    private var outsideClickStart: OutsideClick?
+    private var pendingOutsideClick: DispatchWorkItem?
     var isOverAutomaticToolbar: ((NSPoint) -> Bool)?
     var enabled = true
     private(set) var modelMenuTracking = false
@@ -171,6 +182,7 @@ final class SelectionMonitor {
     private var awaitingExternalInputAfterMenu = false
     func setModelMenuTracking(_ value: Bool) {
         guard value != modelMenuTracking else { return }
+        cancelOutsideClick()
         modelMenuTracking = value; interactionEpoch += 1; revision += 1
         readRequested = false
         if !value {
@@ -192,17 +204,9 @@ final class SelectionMonitor {
     func start() {
         let mask: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .otherMouseDown, .leftMouseDragged, .mouseMoved, .flagsChanged, .keyUp, .keyDown, .scrollWheel]
         global = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] in self?.event($0) }
-        local = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged, .leftMouseDown]) { [weak self] event in
-            if self?.screenshotSuspended == true { return event }
-            self?.onTrackedEvent?(event)
-            self?.onLocalEvent?(event)
-            self?.onInternalEvent?()
-            if let self = self, event.type == .keyDown, event.keyCode == 53, self.modelMenuTracking {
-                self.onMenuCancel?(); return nil
-            }
-            if let self = self, event.type == .keyDown, event.keyCode == 53,
-               !self.modelMenuTracking, event.timestamp > self.ignoreEventsThrough { (self.onCancel ?? self.onScroll)?() }
-            return event
+        local = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown, .otherMouseDown, .scrollWheel]) { [weak self] event in
+            guard let self else { return event }
+            return self.localEvent(event)
         }
         activation = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
             let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
@@ -211,8 +215,75 @@ final class SelectionMonitor {
         }
         attachObserver()
     }
+    @discardableResult func localEvent(_ event: NSEvent) -> NSEvent? {
+        guard !screenshotSuspended else { return event }
+        let tracking = modelMenuTracking
+        onTrackedEvent?(event)
+        onLocalEvent?(event)
+        onInternalEvent?()
+        if event.type == .keyDown, event.keyCode == 53, modelMenuTracking {
+            onMenuCancel?(); return nil
+        }
+        guard !tracking, !modelMenuTracking, event.timestamp > ignoreEventsThrough else { return event }
+        if let click = releasedOutsideClick(event, window: event.window) { confirmSingleClick(click) }
+        if event.type == .keyDown, event.keyCode == 53 { (onCancel ?? onScroll)?() }
+        return event
+    }
+
+    // Keep the event's position even if the pointer has moved by the time AppKit forwards it.
+    private func releasedOutsideClick(_ event: NSEvent, window: NSWindow? = nil) -> OutsideClick? {
+        switch event.type {
+        case .leftMouseDown, .leftMouseUp:
+            let start = outsideClickStart
+            outsideClickStart = nil
+            if event.clickCount > 1 { cancelOutsideClick(); return nil }
+            guard event.clickCount == 1, event.modifierFlags.intersection([.control, .shift, .command, .option, .function]).isEmpty else { return nil }
+            let point = window?.convertPoint(toScreen: event.locationInWindow) ?? event.cgEvent?.unflippedLocation ?? event.locationInWindow
+            let inside = isResultInteraction?(point, window) ?? isInternalInteraction?(point) ?? false
+            guard !inside else { return nil }
+            if event.type == .leftMouseDown {
+                let id = resultDismissalID?()
+                guard resultDismissalID == nil || id != nil else { return nil }
+                outsideClickStart = OutsideClick(point: point, resultID: id)
+            } else if let start, hypot(point.x - start.point.x, point.y - start.point.y) <= 4 {
+                return OutsideClick(point: point, resultID: start.resultID)
+            }
+        case .keyDown where event.keyCode == 53: cancelOutsideClick()
+        case .leftMouseDragged, .rightMouseDown, .otherMouseDown, .scrollWheel, .keyDown:
+            outsideClickStart = nil
+        default: break
+        }
+        return nil
+    }
+    private func confirmSingleClick(_ click: OutsideClick) {
+        // AppKit labels the first release of a double- or triple-click as clickCount 1.
+        pendingOutsideClick?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingOutsideClick = nil
+            guard self.resultDismissalID?() == click.resultID else { return }
+            self.onOutsideClick?(click.point)
+        }
+        pendingOutsideClick = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + NSEvent.doubleClickInterval, execute: work)
+    }
+    private func cancelOutsideClick() {
+        outsideClickStart = nil
+        pendingOutsideClick?.cancel()
+        pendingOutsideClick = nil
+    }
     func applicationActivated(pid: pid_t?) {
         invalidateInternalRead()
+        // A secondary click can activate the source app while opening its context menu.
+        // The workspace notification can arrive before or after the mouse event.
+        let buttons = NSEvent.pressedMouseButtons
+        let contextButtonDown = buttons & 2 != 0 || (buttons & 1 != 0 && NSEvent.modifierFlags.contains(.control))
+        let activatedByContextClick = contextButtonDown || (pid != nil && pid == contextClickTarget)
+        contextClickTarget = nil
+        if activatedByContextClick, isResultVisible?() == true {
+            automaticSelectionSuppressed = true
+            return
+        }
         onContextChanged?()
         if !modelMenuTracking, !awaitingExternalInputAfterMenu, !defersSelectionForScreenshot,
            pid != getpid() { notifySelectionInvalidated() }
@@ -264,38 +335,54 @@ final class SelectionMonitor {
             return
         }
         guard event.timestamp > ignoreEventsThrough else { return }
+        let releasedClick = releasedOutsideClick(event)
+        let contextClick = event.type == .rightMouseDown || (event.type == .leftMouseDown && event.modifierFlags.contains(.control))
         if screenshotWorkPending?() == true {
             // Keep the screenshot and its service requests alive through focus changes and
             // scroll/keyboard activity. An outside click or Escape can still dismiss it.
             let escape = event.type == .keyDown && event.keyCode == 53 && !event.isARepeat
-            guard event.type == .leftMouseDown || escape else { return }
+            guard (event.type == .leftMouseDown && !contextClick) || releasedClick != nil || escape else { return }
         } else if screenshotAwaitingFreshInput, !beginsGestureAfterScreenshot(event) { return }
         awaitingExternalInputAfterMenu = false
-        let point = NSEvent.mouseLocation
+        let point = releasedClick?.point ?? NSEvent.mouseLocation
         let externalKeyboard = [.keyDown, .keyUp, .flagsChanged].contains(event.type) && isOverAutomaticToolbar?(point) == true
         if !(event.type == .keyDown && event.keyCode == 53), !externalKeyboard, isInternalInteraction?(point) == true {
+            if let releasedClick { confirmSingleClick(releasedClick) }
             onInternalEvent?(); invalidateInternalRead(); return
         }
         screenshotAwaitingFreshInput = false
-        if [.leftMouseDown, .keyDown, .scrollWheel].contains(event.type) { hoverOwnsSelection = false }
+        if contextClick || event.type == .scrollWheel {
+            // WebKit may move a text marker or report a different selection as the page scrolls
+            // or opens a context menu. Resume AX reads on the next primary click or key press.
+            automaticSelectionSuppressed = isResultVisible?() == true
+            invalidateInternalRead()
+            if contextClick {
+                contextClickTarget = event.cgEvent.flatMap { pid_t(exactly: $0.getIntegerValueField(.eventTargetUnixProcessID)) }
+            }
+        } else if event.type == .leftMouseDown || event.type == .keyDown {
+            automaticSelectionSuppressed = false
+            contextClickTarget = nil
+        }
         if onExternalEvent?(event) == true { return }
         switch event.type {
-        case .leftMouseDown:
+        case .leftMouseDown where !contextClick:
             // A new drag invalidates both queued and in-flight selection reads,
             // and clears the old glyph even when the result window is pinned.
-            invalidateInternalRead(); notifySelectionInvalidated(); onOutsideClick?(NSEvent.mouseLocation)
-        case .leftMouseUp: schedule()
+            invalidateInternalRead(); notifySelectionInvalidated()
+        case .leftMouseUp:
+            if let releasedClick { confirmSingleClick(releasedClick) }
+            schedule()
         case .keyUp:
             if event.modifierFlags.contains(.shift) || (event.modifierFlags.contains(.command) && event.keyCode == 0) { schedule() }
         case .keyDown:
             if event.keyCode == 53 { invalidateInternalRead(); (onCancel ?? onScroll)?() }
             else if !event.modifierFlags.contains(.shift) && !event.modifierFlags.contains(.command) { invalidateInternalRead(); notifySelectionInvalidated() }
-        case .scrollWheel: invalidateInternalRead(); onScroll?()
+        case .scrollWheel: onScroll?()
         default: break
         }
     }
     func schedule() {
-        guard !defersSelectionForScreenshot, !hoverOwnsSelection, !modelMenuTracking, !awaitingExternalInputAfterMenu else { return }
+        guard !defersSelectionForScreenshot, !automaticSelectionSuppressed, !modelMenuTracking, !awaitingExternalInputAfterMenu else { return }
         if Self.isLeftMouseDown { invalidateInternalRead(); return }
         if pointerBlocksSelectionRead { invalidateInternalRead(); return }
         revision += 1
@@ -304,7 +391,7 @@ final class SelectionMonitor {
         read()
     }
     private func read() {
-        guard !defersSelectionForScreenshot, readRequested, enabled, !hoverOwnsSelection, !modelMenuTracking, !awaitingExternalInputAfterMenu,
+        guard !defersSelectionForScreenshot, readRequested, enabled, !automaticSelectionSuppressed, !modelMenuTracking, !awaitingExternalInputAfterMenu,
               !readInFlight, !Self.isLeftMouseDown,
               let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return }
         readRequested = false
@@ -358,6 +445,7 @@ final class SelectionMonitor {
         interactionEpoch += 1; revision += 1; readRequested = false
     }
     func stop() {
+        cancelOutsideClick()
         invalidateInternalRead()
         if let global = global { NSEvent.removeMonitor(global) }; global = nil
         if let local = local { NSEvent.removeMonitor(local) }; local = nil

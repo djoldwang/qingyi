@@ -75,14 +75,14 @@ extension QingyiTests {
             for text in chinese { app.feedHoverFixture(text) }
             try await Task.sleep(nanoseconds: 50_000_000)
             try expect(sources.isEmpty && !app.floating.resultPanel.isVisible && !app.floating.state.error)
-            try expect(app.monitor.hoverOwnsSelection && !app.floating.buttonPanel.isVisible)
+            try expect(app.monitor.automaticSelectionSuppressed && !app.floating.buttonPanel.isVisible)
             app.feedHoverFixture(paragraph)
             for _ in 0..<100 where !app.floating.state.complete { try await Task.sleep(nanoseconds: 20_000_000) }
             try expect(sources == [paragraph] && app.floating.state.complete && app.floating.resultPanel.isVisible, "Hover completion: sources=\(sources), complete=\(app.floating.state.complete), error=\(app.floating.state.error), text=\(app.floating.state.text)")
             let release = NSEvent.mouseEvent(with: .leftMouseUp, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
             app.monitor.onExternalEvent = { $0.type == .leftMouseUp }
             app.monitor.event(release)
-            try expect(app.monitor.hoverOwnsSelection && app.floating.resultPanel.isVisible && sources.count == 1)
+            try expect(app.monitor.automaticSelectionSuppressed && app.floating.resultPanel.isVisible && sources.count == 1)
             app.floating.state.pinned = true
             let previousID = app.floating.state.sessionID
             let previousText = app.floating.state.text

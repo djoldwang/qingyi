@@ -54,14 +54,26 @@ extension QingyiTests {
             }
             try expect(requests == 0)
         }
-        check("External mouse down invalidates the old selection immediately") {
+        await asyncCheck("External primary clicks invalidate selection on press and dismiss after a confirmed single click") {
             let monitor = SelectionMonitor()
             var clears = 0, outside = 0
             monitor.onSelection = { if $0 == nil { clears += 1 } }
             monitor.onOutsideClick = { _ in outside += 1 }
-            let event = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
-            monitor.event(event)
-            try expect(clears == 1 && outside == 1)
+            func mouse(_ type: NSEvent.EventType, x: CGFloat = 10) -> NSEvent {
+                NSEvent.mouseEvent(with: type, location: NSPoint(x: x, y: 10), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                   windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+            }
+            monitor.event(mouse(.leftMouseDown))
+            try expect(clears == 1 && outside == 0)
+            monitor.event(mouse(.leftMouseUp))
+            try expect(outside == 0, "The first release can still be part of a double-click")
+            try await Task.sleep(for: .seconds(NSEvent.doubleClickInterval + 0.1))
+            try expect(outside == 1)
+            monitor.event(mouse(.leftMouseDown)); monitor.event(mouse(.leftMouseDragged, x: 30)); monitor.event(mouse(.leftMouseUp))
+            monitor.event(mouse(.leftMouseUp))
+            monitor.event(mouse(.leftMouseDown)); monitor.event(mouse(.leftMouseUp, x: 80))
+            try await Task.sleep(for: .seconds(NSEvent.doubleClickInterval + 0.1))
+            try expect(outside == 1, "A drag, unmatched release or large unobserved movement must not dismiss")
         }
         check("Continuous translation font persists fractions, migrates integers and normalizes invalid saved values") {
             let name = "qingyi-font-tests-" + UUID().uuidString

@@ -343,7 +343,7 @@ struct TranslationCard: View {
                         .font(.system(size: 12)).foregroundStyle(state.pinned ? accent : Color.secondary)
                         .frame(width: 23, height: 22)
                 }.buttonStyle(.plain)
-                    .help(state.pinned ? "取消钉住" : "钉住窗口，点击外部或切换应用时保留")
+                    .help(state.pinned ? "取消钉住" : "钉住窗口，在窗外单击时也保留结果")
                     .accessibilityLabel(state.pinned ? "取消钉住" : "钉住\(state.operation.resultName)窗口")
                 TranslationDragArea(operation: state.operation).frame(maxWidth: .infinity).frame(height: 22)
                 if state.loading { ProgressView().controlSize(.small) }

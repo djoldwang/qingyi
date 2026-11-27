@@ -3,7 +3,10 @@ import SwiftUI
 import WebKit
 
 extension QingyiTests {
-    @MainActor static func builtinTranslationTests() async {
+    @MainActor static func waitForClickSequence() async throws {
+        try await Task.sleep(for: .seconds(NSEvent.doubleClickInterval + 0.1))
+    }
+    @MainActor static func resultInteractionTests() async {
         await asyncCheck("Multi-service streaming growth updates the native scroll extent and can reach the bottom") {
             let controller = FloatingController()
             controller.showResult()
@@ -46,6 +49,134 @@ extension QingyiTests {
             guard let nextScroll = findScroll(root) else { throw QingyiError.message("Missing replacement scroll view") }
             try expect(!nextScroll.hasVerticalScroller && nextScroll.contentView.bounds.minY == 0, "Short results must reset scrolling")
         }
+        await asyncCheck("Only a completed outside primary click dismisses an unpinned selection result") {
+            let domain = "qingyi-selection-reader-" + UUID().uuidString
+            let defaults = UserDefaults(suiteName: domain)!
+            defer { defaults.removePersistentDomain(forName: domain) }
+            let settings = BuiltinTranslationSettings(defaults: defaults)
+            settings.google = false
+            settings.ai = false
+            let api = APIConfigurationStore(defaults: defaults, vault: MemoryAPIKeyVault())
+            let engine = TranslationEngine(chat: ChatGPT(defaults: defaults), configuration: api)
+            let client = BuiltinTranslationClient { source in BuiltinTranslationResult(text: "译文 " + source) }
+            let app = AppDelegate(preferences: Preferences(defaults: defaults))
+            app.prepareSelectionFixture(engine: engine, client: client, settings: settings)
+            defer { app.dismissHoverFixture() }
+            // Drive selection changes explicitly without reading the user's foreground application.
+            app.monitor.enabled = false
+            var inside = false
+            app.monitor.isInternalInteraction = { _ in inside }
+            app.monitor.isResultInteraction = { _, _ in inside }
+            let outside = NSPoint(x: 30, y: 30)
+            func mouse(_ type: NSEvent.EventType, at point: NSPoint? = nil, flags: NSEvent.ModifierFlags = [], clicks: Int = 1) -> NSEvent {
+                NSEvent.mouseEvent(with: type, location: point ?? outside, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
+                                   windowNumber: 0, context: nil, eventNumber: 0, clickCount: clicks, pressure: 0)!
+            }
+            func key(_ code: UInt16) -> NSEvent {
+                NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                 windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)!
+            }
+            let state = app.floating.state
+            let panel = app.floating.resultPanel
+            let source = "Read this passage."
+            app.feedSelectionFixture("Offer a translation.")
+            app.monitor.event(screenshotScrollEvent())
+            try expect(!app.floating.buttonPanel.isVisible, "Scrolling should clear the compact selection button")
+            app.feedSelectionFixture(source)
+            app.floating.onTrigger?()
+            let initial = state.sessionID
+            for loading in [true, false] {
+                if !loading { try await waitForPolishing { state.complete } }
+                try expect(state.loading == loading && !state.pinned)
+                for event in [mouse(.rightMouseDown), mouse(.leftMouseDown, flags: .control), mouse(.leftMouseUp),
+                              screenshotScrollEvent(), screenshotScrollEvent(phase: .began), screenshotScrollEvent(momentum: .continuous),
+                              key(125), key(0)] {
+                    app.monitor.event(event)
+                    try expect(panel.isVisible && state.sessionID == initial && state.loading == loading)
+                }
+                app.monitor.applicationActivated(pid: getpid() + 1)
+                app.monitor.onSelection?(nil)
+                try expect(panel.isVisible && state.sessionID == initial && state.loading == loading)
+            }
+            try expect(state.services.first?.result.text == "译文 " + source)
+
+            // Dragging the selection, including an excursion back to its origin, is not a click.
+            app.monitor.event(mouse(.leftMouseDown))
+            try expect(panel.isVisible && state.sessionID == initial)
+            app.monitor.event(mouse(.leftMouseDragged, at: NSPoint(x: 90, y: 30)))
+            app.monitor.event(mouse(.leftMouseUp))
+            try await waitForClickSequence()
+            try expect(panel.isVisible && state.sessionID == initial)
+            // Releasing outside after starting inside, or releasing inside after starting outside, must also preserve the result.
+            for startsInside in [true, false] {
+                inside = startsInside
+                app.monitor.event(mouse(.leftMouseDown))
+                inside = !startsInside
+                app.monitor.event(mouse(.leftMouseUp))
+                try await waitForClickSequence()
+                try expect(panel.isVisible && state.sessionID == initial)
+            }
+            inside = false
+            for count in [2, 3] {
+                for click in 1...count {
+                    app.monitor.event(mouse(.leftMouseDown, clicks: click))
+                    app.monitor.event(mouse(.leftMouseUp, clicks: click))
+                    try expect(panel.isVisible && state.sessionID == initial, "Selecting a word or line must preserve the result")
+                }
+                try await waitForClickSequence()
+                try expect(panel.isVisible && state.sessionID == initial, "The first release in a multi-click must never dismiss later")
+            }
+            app.monitor.event(mouse(.leftMouseDown))
+            app.monitor.event(mouse(.leftMouseUp))
+            try expect(panel.isVisible, "A first release may still be followed by a second click")
+            let nextSource = "Translate the next passage."
+            app.feedSelectionFixture(nextSource)
+            try expect(app.floating.buttonPanel.isVisible && panel.isVisible && state.sessionID == initial,
+                       "A new selection should offer an action alongside the current translation")
+            app.floating.onTrigger?()
+            try await waitForPolishing { state.complete }
+            try await waitForClickSequence()
+            try expect(panel.isVisible && state.sessionID != initial && state.services.first?.result.text == "译文 " + nextSource)
+            @MainActor func resultText(in view: NSView) -> TranslationResultTextView? {
+                if let text = view as? TranslationResultTextView { return text }
+                return view.subviews.lazy.compactMap { resultText(in: $0) }.first
+            }
+            panel.contentView?.layoutSubtreeIfNeeded()
+            guard let root = panel.contentView, let text = resultText(in: root),
+                  let menu = text.menu(for: mouse(.rightMouseDown)) else { throw QingyiError.message("Missing result text menu") }
+            let session = state.sessionID
+            text.menuWillOpen(menu)
+            try expect(app.monitor.modelMenuTracking && menu.item(withTitle: "复制")?.target === text)
+            text.menuDidClose(menu)
+            try expect(!app.monitor.modelMenuTracking && panel.isVisible && state.sessionID == session)
+            state.pinned = true
+            app.monitor.event(mouse(.leftMouseDown))
+            app.monitor.event(mouse(.leftMouseUp))
+            try await waitForClickSequence()
+            try expect(panel.isVisible && state.sessionID == session, "Pinning must protect a result from outside clicks")
+            state.pinned = false
+            app.monitor.event(mouse(.leftMouseUp))
+            try await waitForClickSequence()
+            try expect(panel.isVisible, "An unmatched release must not dismiss a result")
+            app.monitor.event(mouse(.leftMouseDown))
+            try expect(panel.isVisible && state.sessionID == session, "Wait for release before dismissing")
+            app.monitor.event(mouse(.leftMouseUp))
+            try await waitForClickSequence()
+            try expect(!panel.isVisible, "A confirmed single click should dismiss the unpinned result")
+
+            app.feedSelectionFixture("Dismiss this with Escape.")
+            app.floating.onTrigger?()
+            app.monitor.event(key(53))
+            try expect(!panel.isVisible, "Escape should still close the result")
+            app.feedSelectionFixture("Dismiss this with the close button.")
+            app.floating.onTrigger?()
+            try expect(panel.isVisible)
+            app.floating.onClose?()
+            try expect(!panel.isVisible, "The close control should still dismiss an active translation")
+        }
+    }
+    @MainActor static func builtinTranslationTests() async {
+        await resultInteractionTests()
         check("Built-in services default on, preserve explicit off, and normalize display order") {
             let domain = "qingyi-builtin-tests-" + UUID().uuidString
             let defaults = UserDefaults(suiteName: domain)!

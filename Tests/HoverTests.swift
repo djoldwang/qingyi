@@ -178,13 +178,13 @@ extension QingyiTests {
         }
         check("Hover selection ownership blocks AX notifications until the next external input") {
             let monitor = SelectionMonitor(); monitor.enabled = false
-            monitor.suppressAutomaticSelectionForHover(); monitor.schedule()
-            try expect(monitor.hoverOwnsSelection)
+            monitor.suppressAutomaticSelection(); monitor.schedule()
+            try expect(monitor.automaticSelectionSuppressed)
             let mouseUp = NSEvent.mouseEvent(with: .leftMouseUp, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
             monitor.onExternalEvent = { $0.type == .leftMouseUp }
-            monitor.event(mouseUp); try expect(monitor.hoverOwnsSelection)
+            monitor.event(mouseUp); try expect(monitor.automaticSelectionSuppressed)
             let mouseDown = NSEvent.mouseEvent(with: .leftMouseDown, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
-            monitor.event(mouseDown); try expect(!monitor.hoverOwnsSelection)
+            monitor.event(mouseDown); try expect(!monitor.automaticSelectionSuppressed)
         }
         check("Paragraph indexing uses UTF16 and preserves emoji, combining marks and soft wraps") {
             let first = "😀 First e\u{301} paragraph with a visual wrap."

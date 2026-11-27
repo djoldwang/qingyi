@@ -278,7 +278,13 @@ extension QingyiTests {
                 await Task.yield()
                 try expect(app.floating.resultPanel.isVisible && app.floating.state.sessionID == session && app.floating.state.loading,
                            "Focus restoration, selection updates and scrolling must preserve the in-flight screenshot")
-                if cancelWhileLoading { app.monitor.event(key(.keyDown, code: 53)) }
+                if cancelWhileLoading {
+                    app.monitor.event(mouse(.leftMouseDown))
+                    try expect(app.floating.resultPanel.isVisible && app.floating.state.loading)
+                    app.monitor.event(mouse(.leftMouseUp))
+                    try await waitForClickSequence()
+                    try expect(!app.floating.resultPanel.isVisible, "A confirmed outside click can dismiss the in-flight screenshot")
+                }
                 releaseSlowService?.resume(); releaseSlowService = nil
                 if cancelWhileLoading {
                     try await Task.sleep(for: .milliseconds(50))
@@ -290,7 +296,7 @@ extension QingyiTests {
                     app.monitor.event(screenshotScrollEvent(momentum: .continuous))
                     try expect(app.floating.resultPanel.isVisible && app.floating.state.sessionID == session && app.floating.state.complete)
                     try expect(app.floating.state.services.first { $0.id == .youdao }?.result.text == "较慢服务的译文")
-                    app.monitor.event(mouse(.leftMouseDown))
+                    app.monitor.event(key(.keyDown, code: 53))
                 }
                 try expect(!app.floating.resultPanel.isVisible, "The next outside click or Escape should still close the screenshot result")
             }
